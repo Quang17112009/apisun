@@ -21,7 +21,8 @@ import contextlib
 # Khởi tạo client toàn cục
 shared_httpx_client: httpx.AsyncClient | None = None
 
-@contextlib.asynccontext_channel
+@contextlib.asynccontextmanager
+
 async def lifespan(app: FastAPI):
     global shared_httpx_client
     shared_httpx_client = httpx.AsyncClient()
