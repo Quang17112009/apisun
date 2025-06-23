@@ -17,6 +17,7 @@ import numpy as np
 app = FastAPI()
 
 # --- Database Configuration (PostgreSQL) ---
+# Đảm bảo biến môi trường DATABASE_URL được cấu hình trên Render hoặc sử dụng mặc định cho dev
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/taixiu_db")
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
@@ -113,17 +114,13 @@ def predict_with_ml_model(historical_results: List[str]) -> Dict[str, str]:
         print(f"Error during ML prediction: {e}")
         return {"Ket_qua_du_doan": "Lỗi khi chạy mô hình ML", "Do_tin_cay": "N/A"}
 
----
-
-### API Endpoint Cũ (Giả định)
-*Giữ nguyên cho game hiện tại, bạn có thể thay đổi `EXTERNAL_API_URL_OLD` nếu cần.*
-
-```python
+# --- API Endpoint Cũ (Giả định) ---
+# Giữ nguyên cho game hiện tại, bạn có thể thay đổi EXTERNAL_API_URL_OLD nếu cần.
 @app.get("/api/taixiu")
 async def get_taixiu_data_old_api(db: Session = Depends(get_db)):
     # Đây là URL API cũ hoặc URL mà bạn muốn endpoint /api/taixiu sử dụng
     # Thay thế bằng URL API thực tế của game bạn muốn giữ
-    EXTERNAL_API_URL_OLD = "[https://1.bot/GetNewLottery/LT_Taixiu](https://1.bot/GetNewLottery/LT_Taixiu)" # URL giả định từ ví dụ trước
+    EXTERNAL_API_URL_OLD = "https://1.bot/GetNewLottery/LT_Taixiu" # URL giả định từ ví dụ trước
 
     try:
         async with httpx.AsyncClient() as client:
@@ -240,11 +237,7 @@ async def get_taixiu_data_old_api(db: Session = Depends(get_db)):
             detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu (cũ): {e}"
         )
 
----
-
-### API Endpoint Mới (Wanglin API)
-
-```python
+# --- API Endpoint Mới (Wanglin API) ---
 @app.get("/api/taixiu/wanglin") # Đây là endpoint mới
 async def get_taixiu_data_wanglin_api(db: Session = Depends(get_db)):
     # URL API của Wanglin
@@ -364,4 +357,3 @@ async def get_taixiu_data_wanglin_api(db: Session = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu (Wanglin): {e}"
         )
-
