@@ -14,7 +14,24 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
 import numpy as np
 
-app = FastAPI()
+# --- Quản lý client httpx (TÙY CHỌN - Khuyến nghị cho hiệu suất) ---
+# Sử dụng lifespan của FastAPI để tạo và đóng client HTTP một lần
+import contextlib
+
+# Khởi tạo client toàn cục
+shared_httpx_client: httpx.AsyncClient | None = None
+
+@contextlib.asynccontext_channel
+async def lifespan(app: FastAPI):
+    global shared_httpx_client
+    shared_httpx_client = httpx.AsyncClient()
+    print("FastAPI app startup: httpx.AsyncClient initialized.")
+    yield
+    if shared_httpx_client:
+        await shared_httpx_client.aclose()
+        print("FastAPI app shutdown: httpx.AsyncClient closed.")
+
+app = FastAPI(lifespan=lifespan)
 
 # --- Database Configuration (PostgreSQL) ---
 # Đảm bảo biến môi trường DATABASE_URL được cấu hình trên Render hoặc sử dụng mặc định cho dev
@@ -38,10 +55,12 @@ class PhienTaiXiu(Base):
     xuc_xac_3 = Column(Integer)
     created_at = Column(DateTime, default=datetime.now)
 
-# --- KHỞI TẠO BẢNG DATABASE (QUAN TRỌNG) ---
-# Uncomment dòng này VÀ CHẠY ỨNG DỤNG MỘT LẦN ĐỂ TẠO BẢNG trong cơ sở dữ liệu PostgreSQL của bạn.
-# SAU KHI BẢNG ĐƯỢC TẠO THÀNH CÔNG, HÃY COMMENT LẠI dòng này và triển khai lại.
-# Base.metadata.create_all(bind=engine)
+# --- KHỞI TẠO BẢNG DATABASE (QUAN TRỌNG - BỎ COMMENT VÀ CHẠY 1 LẦN) ---
+# Bỏ comment dòng dưới đây VÀ CHẠY ỨNG DỤNG CỦA BẠN MỘT LẦN.
+# Ví dụ: uvicorn main:app --reload (nếu file của bạn tên là main.py)
+# Sau khi bạn thấy bảng đã được tạo thành công trong PostgreSQL (kiểm tra bằng pgAdmin, DBeaver, hoặc psql),
+# HÃY COMMENT LẠI DÒNG NÀY ĐỂ TRÁNH TẠO LẠI BẢNG MỖI KHI KHỞI ĐỘNG ỨNG DỤNG.
+Base.metadata.create_all(bind=engine) # <--- DÒNG NÀY ĐÃ ĐƯỢC BỎ COMMENT
 
 # Dependency để lấy Session DB cho mỗi request
 def get_db():
@@ -62,8 +81,9 @@ def get_tai_xiu_result(xuc_xac_values: List[int]) -> Dict[str, any]:
     ket_qua = "Tài" if 11 <= tong <= 17 else "Xỉu" # Tài: 11-17, Xỉu: 4-10
 
     # Quy tắc cho "Bão" (bộ 3 đồng nhất) - thường được coi là Xỉu
+    # (Nếu tổng là Tài nhưng có 3 xúc xắc giống nhau, vẫn là Xỉu)
     if x1 == x2 == x3:
-        ket_qua = "Xỉu" # Bộ 3 đồng nhất (ví dụ: 1-1-1, 6-6-6) được coi là Xỉu
+        ket_qua = "Xỉu"
 
     return {"Tong": tong, "Xuc_xac_1": x1, "Xuc_xac_2": x2, "Xuc_xac_3": x3, "Ket_qua": ket_qua}
 
@@ -76,6 +96,7 @@ def predict_with_ml_model(historical_results: List[str]) -> Dict[str, str]:
         return {"Ket_qua_du_doan": "Không đủ dữ liệu để huấn luyện ML", "Do_tin_cay": "N/A"}
 
     le = LabelEncoder()
+    # Đảm bảo fit với tất cả các nhãn có thể có
     le.fit(["Tài", "Xỉu"])
     encoded_results = le.transform(historical_results)
 
@@ -83,11 +104,12 @@ def predict_with_ml_model(historical_results: List[str]) -> Dict[str, str]:
     X = []
     y = []
 
+    # Tạo các cặp (đầu vào, nhãn) cho mô hình
     for i in range(len(encoded_results) - window_size):
         X.append(encoded_results[i : i + window_size])
         y.append(encoded_results[i + window_size])
 
-    if not X:
+    if not X: # Đảm bảo có dữ liệu sau khi tạo cửa sổ
         return {"Ket_qua_du_doan": "Không đủ dữ liệu sau khi tạo cửa sổ ML", "Do_tin_cay": "N/A"}
 
     X = np.array(X)
@@ -97,12 +119,14 @@ def predict_with_ml_model(historical_results: List[str]) -> Dict[str, str]:
         model = LogisticRegression(solver='liblinear', random_state=42)
         model.fit(X, y)
 
+        # Lấy N kết quả gần nhất để dự đoán
         last_n_results = encoded_results[-window_size:].reshape(1, -1)
 
         predicted_encoded = model.predict(last_n_results)[0]
         predicted_outcome = le.inverse_transform([predicted_encoded])[0]
 
         probabilities = model.predict_proba(last_n_results)[0]
+        # Tìm độ tin cậy cho kết quả được dự đoán
         confidence_index = np.where(model.classes_ == predicted_encoded)[0][0]
         confidence = probabilities[confidence_index] * 100
 
@@ -115,18 +139,20 @@ def predict_with_ml_model(historical_results: List[str]) -> Dict[str, str]:
         return {"Ket_qua_du_doan": "Lỗi khi chạy mô hình ML", "Do_tin_cay": "N/A"}
 
 # --- API Endpoint Cũ (Giả định) ---
-# Giữ nguyên cho game hiện tại, bạn có thể thay đổi EXTERNAL_API_URL_OLD nếu cần.
 @app.get("/api/taixiu")
 async def get_taixiu_data_old_api(db: Session = Depends(get_db)):
-    # Đây là URL API cũ hoặc URL mà bạn muốn endpoint /api/taixiu sử dụng
-    # Thay thế bằng URL API thực tế của game bạn muốn giữ
     EXTERNAL_API_URL_OLD = "https://1.bot/GetNewLottery/LT_Taixiu" # URL giả định từ ví dụ trước
 
+    if not shared_httpx_client:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Lỗi nội bộ: httpx client chưa được khởi tạo."
+        )
+
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(EXTERNAL_API_URL_OLD, timeout=10.0)
-            response.raise_for_status()
-            external_data = response.json()
+        response = await shared_httpx_client.get(EXTERNAL_API_URL_OLD, timeout=10.0)
+        response.raise_for_status()
+        external_data = response.json()
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -138,7 +164,6 @@ async def get_taixiu_data_old_api(db: Session = Depends(get_db)):
             detail=f"Lỗi khi xử lý phản hồi từ API bên ngoài (cũ): {e}"
         )
 
-    # Logic xử lý dữ liệu từ API cũ (ví dụ: có 'state' và 'data' lồng nhau)
     if external_data.get("state") != 1 or not external_data.get("data"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -177,12 +202,12 @@ async def get_taixiu_data_old_api(db: Session = Depends(get_db)):
                 db.commit()
                 db.refresh(new_phien)
                 current_phien_record = new_phien
-            except IntegrityError:
+            except IntegrityError: # Xử lý trường hợp trùng lặp expect_string
                 db.rollback()
                 current_phien_record = db.query(PhienTaiXiu).filter(
                     PhienTaiXiu.expect_string == expect_str
                 ).first()
-                if not current_phien_record:
+                if not current_phien_record: # Nếu vẫn không tìm thấy sau rollback, là lỗi nghiêm trọng
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail="Lỗi hệ thống: Không thể lưu hoặc truy xuất phiên mới sau lỗi trùng lặp."
@@ -193,127 +218,7 @@ async def get_taixiu_data_old_api(db: Session = Depends(get_db)):
         HISTORY_LIMIT_FOR_ANALYSIS = 200
         DISPLAY_HISTORY_LIMIT = 20
 
-        lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
-
-        lich_su_formatted_full = [
-            {
-                "Phien": p.expect_string,
-                "Ket_qua": p.ket_qua,
-                "Tong": p.tong,
-                "Xuc_xac_1": p.xuc_xac_1,
-                "Xuc_xac_2": p.xuc_xac_2,
-                "Xuc_xac_3": p.xuc_xac_3,
-                "OpenTime": p.open_time.strftime("%Y-%m-%d %H:%M:%S")
-            } for p in lich_su
-        ]
-        lich_su_formatted_display = lich_su_formatted_full[:DISPLAY_HISTORY_LIMIT]
-
-        historical_outcomes_for_analysis = [p["Ket_qua"] for p in lich_su_formatted_full]
-
-        ml_prediction = predict_with_ml_model(historical_outcomes_for_analysis)
-
-        return {
-            "Ket_qua_phien_hien_tai": current_phien_record.ket_qua,
-            "Ma_phien_hien_tai": current_phien_record.expect_string,
-            "Tong_diem_hien_tai": current_phien_record.tong,
-            "Xuc_xac_hien_tai": [
-                current_phien_record.xuc_xac_1,
-                current_phien_record.xuc_xac_2,
-                current_phien_record.xuc_xac_3
-            ],
-            "admin_name": "Nhutquang", # Giữ nguyên 'Nhutquang' hoặc chỉnh sửa nếu API cũ có trường tương tự
-            "Lich_su_gan_nhat": lich_su_formatted_display,
-            "Du_doan_phien_tiep_theo_ML": ml_prediction
-        }
-
-    except (KeyError, ValueError) as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Dữ liệu từ API bên ngoài (cũ) không đúng định dạng hoặc thiếu trường bắt buộc: {e}"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu (cũ): {e}"
-        )
-
-# --- API Endpoint Mới (Wanglin API) ---
-@app.get("/api/taixiu/wanglin") # Đây là endpoint mới
-async def get_taixiu_data_wanglin_api(db: Session = Depends(get_db)):
-    # URL API của Wanglin
-    EXTERNAL_API_URL_WANGLIN = "https://wanglinapiws.up.railway.app/api/taixiu"
-
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(EXTERNAL_API_URL_WANGLIN, timeout=10.0)
-            response.raise_for_status()
-            external_data = response.json()
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi khi kết nối đến API Wanglin: {exc}. Vui lòng thử lại sau."
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi khi xử lý phản hồi từ API Wanglin: {e}"
-        )
-
-    # Kiểm tra dữ liệu từ API Wanglin
-    if not external_data or not all(k in external_data for k in ["Ket_qua", "Phien", "Tong", "Xuc_xac_1", "Xuc_xac_2", "Xuc_xac_3", "id"]):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Dữ liệu từ API Wanglin không hợp lệ hoặc thiếu trường bắt buộc."
-        )
-
-    try:
-        expect_str = str(external_data["Phien"])
-        ket_qua_str = external_data["Ket_qua"]
-        tong_val = external_data["Tong"]
-        xuc_xac_1_val = external_data["Xuc_xac_1"]
-        xuc_xac_2_val = external_data["Xuc_xac_2"]
-        xuc_xac_3_val = external_data["Xuc_xac_3"]
-        # API Wanglin không có OpenTime, sử dụng thời gian hiện tại
-        open_time_dt = datetime.now()
-        admin_id_from_api = external_data["id"]
-
-        current_phien_record: Optional[PhienTaiXiu] = None
-
-        existing_phien = db.query(PhienTaiXiu).filter(
-            PhienTaiXiu.expect_string == expect_str
-        ).first()
-
-        if not existing_phien:
-            new_phien = PhienTaiXiu(
-                expect_string=expect_str,
-                open_time=open_time_dt,
-                ket_qua=ket_qua_str, # Trực tiếp từ API Wanglin
-                tong=tong_val, # Trực tiếp từ API Wanglin
-                xuc_xac_1=xuc_xac_1_val, # Trực tiếp từ API Wanglin
-                xuc_xac_2=xuc_xac_2_val, # Trực tiếp từ API Wanglin
-                xuc_xac_3=xuc_xac_3_val # Trực tiếp từ API Wanglin
-            )
-            db.add(new_phien)
-            try:
-                db.commit()
-                db.refresh(new_phien)
-                current_phien_record = new_phien
-            except IntegrityError:
-                db.rollback()
-                current_phien_record = db.query(PhienTaiXiu).filter(
-                    PhienTaiXiu.expect_string == expect_str
-                ).first()
-                if not current_phien_record:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Lỗi hệ thống: Không thể lưu hoặc truy xuất phiên mới sau lỗi trùng lặp."
-                    )
-        else:
-            current_phien_record = existing_phien
-
-        HISTORY_LIMIT_FOR_ANALYSIS = 200
-        DISPLAY_HISTORY_LIMIT = 20
-
+        # Lấy lịch sử và sắp xếp theo expect_string giảm dần (phiên mới nhất lên đầu)
         lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
 
         lich_su_formatted_full = [
@@ -342,7 +247,131 @@ async def get_taixiu_data_wanglin_api(db: Session = Depends(get_db)):
                 current_phien_record.xuc_xac_2,
                 current_phien_record.xuc_xac_3
             ],
-            "admin_name": admin_id_from_api, # Lấy 'id' từ API Wanglin
+            "admin_name": "Nhutquang",
+            "Lich_su_gan_nhat": lich_su_formatted_display,
+            "Du_doan_phien_tiep_theo_ML": ml_prediction
+        }
+
+    except (KeyError, ValueError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Dữ liệu từ API bên ngoài (cũ) không đúng định dạng hoặc thiếu trường bắt buộc: {e}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi không xác định trong quá trình xử lý yêu cầu (cũ): {e}"
+        )
+
+# --- API Endpoint Mới (Wanglin API) ---
+@app.get("/api/taixiu/wanglin") # Đây là endpoint mới
+async def get_taixiu_data_wanglin_api(db: Session = Depends(get_db)):
+    EXTERNAL_API_URL_WANGLIN = "https://wanglinapiws.up.railway.app/api/taixiu"
+
+    if not shared_httpx_client:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Lỗi nội bộ: httpx client chưa được khởi tạo."
+        )
+
+    try:
+        response = await shared_httpx_client.get(EXTERNAL_API_URL_WANGLIN, timeout=10.0)
+        response.raise_for_status()
+        external_data = response.json()
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi kết nối đến API Wanglin: {exc}. Vui lòng thử lại sau."
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi xử lý phản hồi từ API Wanglin: {e}"
+        )
+
+    if not external_data or not all(k in external_data for k in ["Ket_qua", "Phien", "Tong", "Xuc_xac_1", "Xuc_xac_2", "Xuc_xac_3", "id"]):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Dữ liệu từ API Wanglin không hợp lệ hoặc thiếu trường bắt buộc."
+        )
+
+    try:
+        expect_str = str(external_data["Phien"])
+        ket_qua_str = external_data["Ket_qua"]
+        tong_val = external_data["Tong"]
+        xuc_xac_1_val = external_data["Xuc_xac_1"]
+        xuc_xac_2_val = external_data["Xuc_xac_2"]
+        xuc_xac_3_val = external_data["Xuc_xac_3"]
+        open_time_dt = datetime.now() # API Wanglin không có OpenTime, sử dụng thời gian hiện tại
+        admin_id_from_api = external_data["id"]
+
+        current_phien_record: Optional[PhienTaiXiu] = None
+
+        existing_phien = db.query(PhienTaiXiu).filter(
+            PhienTaiXiu.expect_string == expect_str
+        ).first()
+
+        if not existing_phien:
+            new_phien = PhienTaiXiu(
+                expect_string=expect_str,
+                open_time=open_time_dt,
+                ket_qua=ket_qua_str,
+                tong=tong_val,
+                xuc_xac_1=xuc_xac_1_val,
+                xuc_xac_2=xuc_xac_2_val,
+                xuc_xac_3=xuc_xac_3_val
+            )
+            db.add(new_phien)
+            try:
+                db.commit()
+                db.refresh(new_phien)
+                current_phien_record = new_phien
+            except IntegrityError: # Xử lý trường hợp trùng lặp expect_string
+                db.rollback()
+                current_phien_record = db.query(PhienTaiXiu).filter(
+                    PhienTaiXiu.expect_string == expect_str
+                ).first()
+                if not current_phien_record: # Nếu vẫn không tìm thấy sau rollback, là lỗi nghiêm trọng
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Lỗi hệ thống: Không thể lưu hoặc truy xuất phiên mới sau lỗi trùng lặp."
+                    )
+        else:
+            current_phien_record = existing_phien
+
+        HISTORY_LIMIT_FOR_ANALYSIS = 200
+        DISPLAY_HISTORY_LIMIT = 20
+
+        # Lấy lịch sử và sắp xếp theo expect_string giảm dần (phiên mới nhất lên đầu)
+        lich_su = db.query(PhienTaiXiu).order_by(PhienTaiXiu.expect_string.desc()).limit(HISTORY_LIMIT_FOR_ANALYSIS).all()
+
+        lich_su_formatted_full = [
+            {
+                "Phien": p.expect_string,
+                "Ket_qua": p.ket_qua,
+                "Tong": p.tong,
+                "Xuc_xac_1": p.xuc_xac_1,
+                "Xuc_xac_2": p.xuc_xac_2,
+                "Xuc_xac_3": p.xuc_xac_3,
+                "OpenTime": p.open_time.strftime("%Y-%m-%d %H:%M:%S") if p.open_time else None
+            } for p in lich_su
+        ]
+        lich_su_formatted_display = lich_su_formatted_full[:DISPLAY_HISTORY_LIMIT]
+
+        historical_outcomes_for_analysis = [p["Ket_qua"] for p in lich_su_formatted_full]
+
+        ml_prediction = predict_with_ml_model(historical_outcomes_for_analysis)
+
+        return {
+            "Ket_qua_phien_hien_tai": current_phien_record.ket_qua,
+            "Ma_phien_hien_tai": current_phien_record.expect_string,
+            "Tong_diem_hien_tai": current_phien_record.tong,
+            "Xuc_xac_hien_tai": [
+                current_phien_record.xuc_xac_1,
+                current_phien_record.xuc_xac_2,
+                current_phien_record.xuc_xac_3
+            ],
+            "admin_name": admin_id_from_api,
             "Lich_su_gan_nhat": lich_su_formatted_display,
             "Du_doan_phien_tiep_theo_ML": ml_prediction
         }
