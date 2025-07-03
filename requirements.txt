@@ -4,3 +4,4 @@ requests
 waitress
 scikit-learn
 joblib
+websocket-client
