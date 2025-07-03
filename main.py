@@ -8,7 +8,7 @@ import logging
 from collections import defaultdict, deque
 from flask import Flask, jsonify
 from flask_cors import CORS
-import websocket
+import requests # Import the requests library for HTTP requests
 
 # --- Basic Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -379,50 +379,56 @@ def create_app():
     app.last_prediction = None
     app.pattern_accuracy = defaultdict(lambda: {"success": 0, "total": 0})
     
-    # --- Xử lý WebSocket ---
-    # !!! URL ĐÃ ĐƯỢC CẬP NHẬT Ở ĐÂY !!!
-    app.WS_URL = os.getenv("WS_URL", "wss://wscard.azhkthg1.net/websocket4")
+    # --- Xử lý API HTTP ---
+    app.API_URL = os.getenv("API_URL", "https://taixiu-qbwo.onrender.com/api/axocuto")
 
-    def on_data(ws, data):
+    def fetch_data_from_api():
         try:
-            message = json.loads(data)
-            phien = message.get("Phien")
-            
-            if "Ket_qua" not in message or phien is None: return
+            response = requests.get(app.API_URL, timeout=5)
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            data = response.json()
+            return data
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error fetching data from API: {e}")
+            return None
 
-            ket_qua = message.get("Ket_qua")
-            if ket_qua not in ["Tài", "Xỉu"]: return
-            
-            with app.lock:
-                # Chỉ thêm dữ liệu mới nếu phiên chưa tồn tại hoặc là phiên mới nhất
-                if not app.session_ids or phien > app.session_ids[-1]:
-                    app.session_ids.append(phien)
-                    app.history.append({'ket_qua': ket_qua, 'phien': phien})
-                    logging.info(f"New result for session {phien}: {ket_qua}")
-                
-        except (json.JSONDecodeError, TypeError): pass
-        except Exception as e: logging.error(f"Error in on_data: {e}")
-
-    def on_error(ws, error): logging.error(f"WebSocket error: {error}")
-    def on_close(ws, close_status_code, close_msg): logging.info("WebSocket closed. Reconnecting...")
-    def on_open(ws): logging.info("WebSocket connection opened.")
-
-    def start_ws():
+    def data_fetch_loop():
+        last_processed_session = None
         while True:
-            logging.info(f"Connecting to WebSocket: {app.WS_URL}")
-            try:
-                ws = websocket.WebSocketApp(
-                    app.WS_URL,
-                    on_open=on_open, on_message=on_data, on_error=on_error, on_close=on_close
-                )
-                ws.run_forever(ping_interval=30, ping_timeout=10)
-            except Exception as e: logging.error(f"WebSocket run_forever crashed: {e}")
-            logging.info("WebSocket run_forever ended. Restarting after 5 seconds.")
-            time.sleep(5)
+            data = fetch_data_from_api()
+            if data:
+                try:
+                    phien = data.get("Phien")
+                    ket_qua = data.get("Ket_qua")
+
+                    if phien is None or ket_qua not in ["Tài", "Xỉu"]:
+                        logging.warning(f"Invalid data received from API: {data}")
+                        time.sleep(1) # Wait a bit before retrying
+                        continue
+
+                    with app.lock:
+                        # Only add new data if the session is newer than the last processed one
+                        if not app.session_ids or phien > app.session_ids[-1]:
+                            app.session_ids.append(phien)
+                            app.history.append({'ket_qua': ket_qua, 'phien': phien})
+                            logging.info(f"New result for session {phien}: {ket_qua}")
+                            last_processed_session = phien
+                        else:
+                            # If the session is not newer, log that we've already processed it
+                            if phien == app.session_ids[-1]:
+                                logging.debug(f"Session {phien} already processed.")
+                            else:
+                                logging.debug(f"Received older session {phien}. Current latest is {app.session_ids[-1]}.")
+                except (json.JSONDecodeError, TypeError) as e:
+                    logging.error(f"Error decoding or processing API data: {e} - Data: {data}")
+                except Exception as e:
+                    logging.error(f"Unexpected error in data_fetch_loop: {e}")
+            
+            time.sleep(1) # Poll the API every 1 second
 
     # --- API Endpoints ---
-    @app.route("/api/taixiu_ws", methods=["GET"])
-    def get_taixiu_ws_prediction():
+    @app.route("/api/taixiu_ws", methods=["GET"]) # Renamed from taixiu_ws to avoid confusion, but kept for compatibility
+    def get_taixiu_prediction():
         with app.lock:
             if len(app.history) < 2:
                 return jsonify({"error": "Chưa có đủ dữ liệu"}), 500
@@ -432,8 +438,9 @@ def create_app():
             last_prediction_copy = app.last_prediction
         
         # --- Bước học Online (Online Learning) ---
-        # Chỉ học khi có kết quả mới cho phiên đã dự đoán
-        if last_prediction_copy and last_prediction_copy['session'] == session_ids_copy[-1]:
+        # Only learn if a new result is available for the session that was predicted
+        # Ensure we have at least one past result to compare with for learning
+        if last_prediction_copy and session_ids_copy and last_prediction_copy['session'] == session_ids_copy[-1]:
             prev_history_str = _get_history_strings(history_copy[:-1])
             actual_result = history_copy[-1]['ket_qua']
             
@@ -464,15 +471,16 @@ def create_app():
         
         # Lưu lại thông tin dự đoán để học ở lần tiếp theo
         with app.lock:
-            current_session = session_ids_copy[-1]
-            app.last_prediction = {
-                'session': current_session + 1,
-                'prediction': prediction_str,
-                'pattern': pattern_str,
-                'features': get_logistic_features(history_str_for_prediction),
-                'individual_predictions': individual_preds,
-            }
-            current_result = history_copy[-1]['ket_qua']
+            current_session = session_ids_copy[-1] if session_ids_copy else None # Handle case where history is empty
+            if current_session is not None:
+                app.last_prediction = {
+                    'session': current_session + 1,
+                    'prediction': prediction_str,
+                    'pattern': pattern_str,
+                    'features': get_logistic_features(history_str_for_prediction),
+                    'individual_predictions': individual_preds,
+                }
+            current_result = history_copy[-1]['ket_qua'] if history_copy else None
         
         # Tinh chỉnh hiển thị
         prediction_display = prediction_str
@@ -482,11 +490,10 @@ def create_app():
         else:
             final_confidence_display = round(confidence, 1)
 
-
         return jsonify({
             "current_session": current_session,
             "current_result": current_result,
-            "next_session": current_session + 1,
+            "next_session": current_session + 1 if current_session is not None else None,
             "prediction": prediction_display,
             "confidence_percent": final_confidence_display,
             "suggested_pattern": pattern_str,
@@ -525,8 +532,9 @@ def create_app():
             "model_weights": app.model_weights
         })
 
-    ws_thread = threading.Thread(target=start_ws, daemon=True)
-    ws_thread.start()
+    # Start the HTTP data fetching thread
+    api_fetch_thread = threading.Thread(target=data_fetch_loop, daemon=True)
+    api_fetch_thread.start()
     return app
 
 # --- Thực thi chính ---
