@@ -328,22 +328,20 @@ def apply_meta_logic(prediction, confidence, history_str, suggested_pattern_info
 
 def predict_advanced(app, history_str):
     """Hàm điều phối dự đoán nâng cao, kết hợp nhiều mô hình với trọng số động."""
+    # THAY ĐỔI Ở ĐÂY: Trả về dictionary rỗng cho individual_preds khi lịch sử quá ngắn
     if len(history_str) < 5:
-        # Giảm số lượng history cần thiết để có dự đoán sơ bộ sớm hơn
         if len(history_str) < 2:
-             return "Chờ dữ liệu", "Chưa đủ lịch sử", 50.0, None # Changed to None instead of empty dict
-        # Nếu có ít nhất 2 kết quả, có thể đưa ra dự đoán ban đầu dựa trên Markov hoặc Pattern cơ bản
+             return "Chờ dữ liệu", "Chưa đủ lịch sử", 50.0, {} # Đã thay đổi None thành {}
+        
         last_result = history_str[-1]
         anti_last = 'Xỉu' if last_result == 'Tài' else 'Tài'
         
-        # Dự đoán cơ bản: theo Markov (nếu có dữ liệu) hoặc bẻ cầu
         if len(history_str) >= 1:
             last_result_idx = 0 if last_result == 'Tài' else 1
             prob_tai_markov = app.transition_matrix[last_result_idx][0]
             initial_pred = 'Tài' if prob_tai_markov > 0.5 else 'Xỉu'
             initial_conf = max(prob_tai_markov, 1 - prob_tai_markov) * 100
             
-            # Nếu cầu bệt ngắn (2-3) thì theo, nếu không thì bẻ
             streak_len = 0
             if len(history_str) > 0:
                 last_val = history_str[-1]
@@ -351,12 +349,12 @@ def predict_advanced(app, history_str):
                     if x == last_val: streak_len += 1
                     else: break
             
-            if streak_len >= 2 and initial_pred == last_val: # Theo bệt ngắn
-                return initial_pred, "Theo bệt ngắn", min(initial_conf + 10, 80.0), None # Changed to None
-            else: # Nếu không bệt thì thử bẻ
-                return anti_last, "Bẻ cầu cơ bản", min(initial_conf + 5, 70.0), None # Changed to None
+            if streak_len >= 2 and initial_pred == last_val:
+                return initial_pred, "Theo bệt ngắn", min(initial_conf + 10, 80.0), {} # Đã thay đổi None thành {}
+            else:
+                return anti_last, "Bẻ cầu cơ bản", min(initial_conf + 5, 70.0), {} # Đã thay đổi None thành {}
         
-        return "Chờ dữ liệu", "Phân tích", 50.0, None # Changed to None
+        return "Chờ dữ liệu", "Phân tích", 50.0, {} # Đã thay đổi None thành {}
 
     last_result = history_str[-1]
 
@@ -510,7 +508,8 @@ def create_app():
     def get_taixiu_prediction():
         with app.lock:
             if len(app.history) < 2:
-                return jsonify({"error": "Chưa có đủ dữ liệu"}), 500
+                # Trả về lỗi hoặc trạng thái "chờ dữ liệu" nếu lịch sử quá ngắn
+                return jsonify({"error": "Chưa có đủ dữ liệu", "prediction": "Đang phân tích", "confidence_percent": 50.0, "suggested_pattern": "Chưa đủ lịch sử"}), 500
             
             history_copy = list(app.history)
             session_ids_copy = list(app.session_ids)
@@ -532,11 +531,14 @@ def create_app():
                 # Học cho Pattern
                 update_pattern_accuracy(app, last_prediction_copy['pattern_name_for_learning'], last_prediction_copy['prediction'], actual_result)
                 
-                # Cập nhật hiệu suất của từng mô hình con để điều chỉnh trọng số
-                for model_name, model_pred in last_prediction_copy['individual_predictions'].items():
-                    app.model_performance[model_name]['total'] += 1
-                    if model_pred == actual_result:
-                        app.model_performance[model_name]['success'] += 1
+                # THAY ĐỔI Ở ĐÂY: Thêm kiểm tra None cho 'individual_predictions'
+                if last_prediction_copy.get('individual_predictions') is not None:
+                    for model_name, model_pred in last_prediction_copy['individual_predictions'].items():
+                        app.model_performance[model_name]['total'] += 1
+                        if model_pred == actual_result:
+                            app.model_performance[model_name]['success'] += 1
+                else:
+                    logging.warning(f"individual_predictions was None for session {session_ids_copy[-1]}. Skipping model performance update.")
                 
                 # Cập nhật lại trọng số của ensemble model
                 update_model_weights(app)
@@ -559,7 +561,7 @@ def create_app():
                     'prediction': prediction_str,
                     'pattern_name_for_learning': pattern_str, # Lưu tên pattern để học
                     'features': get_logistic_features(history_str_for_prediction),
-                    'individual_predictions': individual_preds,
+                    'individual_predictions': individual_preds, # Đảm bảo rằng individual_preds không phải là None
                 }
             current_result = history_copy[-1]['ket_qua'] if history_copy else None
         
