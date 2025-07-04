@@ -11,7 +11,6 @@ from flask_cors import CORS
 import requests # Import the requests library for HTTP requests
 
 # --- Basic Setup ---
-# Cấu hình logging để dễ dàng theo dõi lỗi và thông báo
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # --- Helper Functions ---
@@ -19,6 +18,21 @@ def _get_history_strings(history_list):
     """Hàm trợ giúp để lấy danh sách chuỗi 'Tài'/'Xỉu' từ danh sách dict."""
     return [item['ket_qua'] for item in history_list]
 
+def _normalize_features(features):
+    """Chuẩn hóa các đặc trưng để chúng có cùng khoảng giá trị."""
+    # Đây là một ví dụ đơn giản, bạn có thể sử dụng StandardScaler từ sklearn nếu cần phức tạp hơn.
+    normalized_features = []
+    # Ví dụ: Chuẩn hóa streak lengths (max có thể là MAX_HISTORY_LEN)
+    normalized_features.append(features[0] / 200.0) # Current streak (giả sử max 200)
+    normalized_features.append(features[1] / 200.0) # Previous streak (giả sử max 200)
+    # Balance features đã ở trong khoảng [-1, 1]
+    normalized_features.append(features[2])
+    normalized_features.append(features[3])
+    # Volatility đã ở trong khoảng [0, 1]
+    normalized_features.append(features[4])
+    # Alternations (giả sử max 10)
+    normalized_features.append(features[5] / 10.0)
+    return normalized_features
 
 # 1. Định nghĩa các Patterns (Mở rộng với các pattern phức tạp và siêu phức tạp)
 def define_patterns():
@@ -97,133 +111,221 @@ def define_patterns():
         "Cầu Sandwich": lambda h: len(h) >= 5 and h[-1] == h[-5] and h[-2] == h[-3] == h[-4] and h[-1] != h[-2],
         "Cầu Thang máy": lambda h: len(h) >= 7 and h[-7:] == [h[-7],h[-7],h[-5],h[-5],h[-3],h[-3],h[-1]] and len(set(h[-7:]))==4, # T-T-X-X-T-T-X
         "Cầu Sóng vỗ": lambda h: len(h) >= 8 and h[-8:] == [h[-8],h[-8],h[-6],h[-8],h[-8],h[-6],h[-8],h[-8]],
+        "Cầu Đỉnh-Đáy": lambda h: len(h) >= 7 and h[-7:] == [h[-7], h[-7], h[-6], h[-6], h[-5], h[-5], h[-4]] and len(set(h[-7:])) == 3, # T-T-X-X-T-T-X
+        "Cầu Lưới": lambda h: len(h) >= 6 and h[-6:] == [h[-6], h[-5], h[-5], h[-4], h[-4], h[-3]] and len(set(h[-6:])) == 3, # T-X-X-T-T-X
     }
     return patterns
 
-# 2. Các hàm cập nhật và huấn luyện mô hình (IMPROVED)
+# 2. Các hàm cập nhật và huấn luyện mô hình
 def update_transition_matrix(app, prev_result, current_result):
     if not prev_result: return
     prev_idx = 0 if prev_result == 'Tài' else 1
     curr_idx = 0 if current_result == 'Tài' else 1
     app.transition_counts[prev_idx][curr_idx] += 1
     total_transitions = sum(app.transition_counts[prev_idx])
-    alpha = 1 # Laplace smoothing
+    alpha = 1 # Laplace smoothing để tránh xác suất bằng 0
     num_outcomes = 2
     app.transition_matrix[prev_idx][0] = (app.transition_counts[prev_idx][0] + alpha) / (total_transitions + alpha * num_outcomes)
     app.transition_matrix[prev_idx][1] = (app.transition_counts[prev_idx][1] + alpha) / (total_transitions + alpha * num_outcomes)
 
-def update_pattern_accuracy(app, predicted_pattern_name, prediction, actual_result):
-    if not predicted_pattern_name: return
-    stats = app.pattern_accuracy[predicted_pattern_name]
+def update_pattern_accuracy(app, detected_pattern_name, actual_result, history_str_used_for_detection):
+    """
+    Cập nhật độ chính xác của pattern VÀ thống kê kết quả tiếp theo của pattern đó.
+    history_str_used_for_detection là lịch sử tại thời điểm pattern được phát hiện.
+    """
+    if not detected_pattern_name: return
+
+    # Cập nhật tổng số và số lần thành công
+    stats = app.pattern_accuracy[detected_pattern_name]
     stats['total'] += 1
-    if prediction == actual_result:
-        stats['success'] += 1
+    # Dự đoán của pattern là dựa trên thống kê, nên chúng ta cần biết pattern đó đã "dự đoán" gì
+    # Giả sử pattern dự đoán kết quả có xác suất cao hơn sau nó
+    p_stats = app.pattern_outcome_stats[detected_pattern_name]
+    total_p = p_stats['Tài'] + p_stats['Xỉu']
+    
+    if total_p > 0:
+        if p_stats['Tài'] / total_p > 0.5: # Pattern có xu hướng về Tài
+            if actual_result == 'Tài':
+                stats['success'] += 1
+        else: # Pattern có xu hướng về Xỉu
+            if actual_result == 'Xỉu':
+                stats['success'] += 1
+    # Nếu chưa có đủ thống kê về kết quả tiếp theo, chỉ đơn giản là cập nhật nếu pattern khớp với kết quả
+    # Điều này là một cách xử lý ban đầu, sau này khi có đủ dữ liệu, predict_with_pattern sẽ thông minh hơn.
+    elif history_str_used_for_detection and len(history_str_used_for_detection) > 0:
+        # Nếu pattern chỉ đơn thuần là "theo" kết quả cuối cùng hoặc "bẻ" kết quả cuối cùng
+        last_h = history_str_used_for_detection[-1]
+        anti_last_h = 'Xỉu' if last_h == 'Tài' else 'Tài'
+        
+        # Một cách tạm thời để đánh giá ban đầu
+        # Nếu pattern là bệt hoặc nhịp, thường dự đoán theo kết quả cuối
+        if any(p in detected_pattern_name for p in ["Bệt", "kép", "Nhịp", "Sóng vỗ"]):
+            if actual_result == last_h:
+                stats['success'] += 1
+        # Nếu pattern là đảo, xen kẽ, thường dự đoán bẻ cầu
+        elif any(p in detected_pattern_name for p in ["Đảo", "Xen kẽ", "lắc", "Đối ngược", "gãy", "Bậc thang"]):
+            if actual_result == anti_last_h:
+                stats['success'] += 1
+        else: # Các pattern khác, giả định trung lập ban đầu
+            # Nếu chưa có đủ dữ liệu học, coi như 50/50
+            pass
+
+
+    # Cập nhật thống kê kết quả tiếp theo cho pattern
+    p_stats = app.pattern_outcome_stats[detected_pattern_name]
+    if actual_result == 'Tài':
+        p_stats['Tài'] += 1
+    else:
+        p_stats['Xỉu'] += 1
+    p_stats['total'] += 1
+
 
 def train_logistic_regression(app, features, actual_result):
-    y = 1.0 if actual_result == 'Tài' else 0.0
-    z = app.logistic_bias + sum(w * f for w, f in zip(app.logistic_weights, features))
+    if not features: return
+    
+    # Chuẩn hóa features trước khi huấn luyện
+    normalized_features = _normalize_features(features)
+
+    y = 1.0 if actual_result == 'Tài' else 0.0 # 1.0 cho Tài, 0.0 cho Xỉu
+    z = app.logistic_bias + sum(w * f for w, f in zip(app.logistic_weights, normalized_features))
     try:
-        p = 1.0 / (1.0 + math.exp(-z))
-    except OverflowError:
+        p = 1.0 / (1.0 + math.exp(-z)) # Sigmoid function
+    except OverflowError: # Xử lý trường hợp z quá lớn hoặc quá nhỏ
         p = 0.0 if z < 0 else 1.0
         
-    error = y - p
+    error = y - p # Sai số
+    
+    # Cập nhật bias
     app.logistic_bias += app.learning_rate * error
+    # Cập nhật trọng số
     for i in range(len(app.logistic_weights)):
-        gradient = error * features[i]
+        gradient = error * normalized_features[i]
         regularization_term = app.regularization * app.logistic_weights[i]
         app.logistic_weights[i] += app.learning_rate * (gradient - regularization_term)
 
 def update_model_weights(app):
-    """Cập nhật trọng số của các mô hình trong ensemble dựa trên hiệu suất."""
-    total_accuracy = 0
+    """Cập nhật trọng số của các mô hình trong ensemble dựa trên hiệu suất động."""
+    total_weighted_accuracy = 0
     accuracies = {}
+    
+    # Tính toán độ chính xác thực tế của từng mô hình
     for name, perf in app.model_performance.items():
-        if perf['total'] > 5: # Chỉ cập nhật nếu có đủ dữ liệu
+        if perf['total'] >= 10: # Cần ít nhất 10 điểm dữ liệu để có độ chính xác ý nghĩa
             accuracy = perf['success'] / perf['total']
             accuracies[name] = accuracy
-            total_accuracy += accuracy
-        else: # Giữ trọng số mặc định nếu chưa đủ dữ liệu
-            accuracies[name] = app.default_model_weights[name] * 2 # Tạm thời tăng để không bị loại bỏ hoàn toàn
-            total_accuracy += app.default_model_weights[name] * 2
+        else: # Nếu chưa đủ dữ liệu, dùng độ chính xác mặc định (hoặc khởi tạo hợp lý)
+            accuracies[name] = app.default_model_weights[name] # Sử dụng trọng số mặc định làm đại diện cho "độ chính xác" ban đầu
+    
+    # Tính tổng weighted accuracy để chuẩn hóa
+    for name in app.model_weights:
+        # Trọng số mới tỉ lệ thuận với độ chính xác hiện tại của mô hình đó
+        # Thêm một hệ số "làm mượt" để tránh quá nhạy cảm với biến động nhỏ
+        app.model_weights[name] = (app.model_weights[name] * 0.8) + (accuracies[name] * 0.2) # Ví dụ: 80% trọng số cũ, 20% độ chính xác mới
+        total_weighted_accuracy += app.model_weights[name]
 
-    if total_accuracy > 0:
+    # Chuẩn hóa lại để tổng bằng 1
+    if total_weighted_accuracy > 0:
         for name in app.model_weights:
-            app.model_weights[name] = accuracies[name] / total_accuracy
-    # Normalize lại để tổng bằng 1
-    total_weight = sum(app.model_weights.values())
-    if total_weight > 0:
-        for name in app.model_weights:
-            app.model_weights[name] /= total_weight
+            app.model_weights[name] /= total_weighted_accuracy
+    else: # Trường hợp tổng bằng 0, khởi tạo lại trọng số mặc định
+        app.model_weights = app.default_model_weights.copy()
+        
     logging.info(f"Updated model weights: {app.model_weights}")
 
-
-# 3. Các hàm dự đoán cốt lõi (IMPROVED)
+# 3. Các hàm dự đoán cốt lõi
 def detect_pattern(app, history_str):
     detected_patterns = []
     if len(history_str) < 2: return None
     
-    total_occurrences = max(1, sum(s['total'] for s in app.pattern_accuracy.values()))
+    # Tổng số lần xuất hiện của tất cả các pattern (để tính điểm recency)
+    total_occurrences_all_patterns = sum(s['total'] for s in app.pattern_accuracy.values())
+    total_occurrences_all_patterns = max(1, total_occurrences_all_patterns) # Tránh chia cho 0
 
     for name, func in app.patterns.items():
         try:
             if func(history_str):
                 stats = app.pattern_accuracy[name]
-                # Cải thiện cách tính accuracy: thêm Laplace smoothing hoặc ngưỡng tối thiểu
-                # Giúp tránh trường hợp total nhỏ mà accuracy = 100% gây tự tin thái quá
-                accuracy = (stats['success'] + 1) / (stats['total'] + 2) if stats['total'] > 0 else 0.55 # Laplace smoothing
-                # Thêm một ngưỡng tối thiểu cho accuracy khi pattern có ít dữ liệu
-                if stats['total'] < 10:
-                    accuracy = max(accuracy, 0.55) # Giới hạn độ tin cậy ban đầu cho pattern mới
-
-                recency_score = stats['total'] / total_occurrences if total_occurrences > 0 else 0.0
+                
+                # Tính toán accuracy của pattern (dựa trên pattern_accuracy)
+                accuracy = (stats['success'] / stats['total']) if stats['total'] >= 5 else 0.55 # Ưu tiên nhẹ nếu chưa đủ dữ liệu
+                
+                # Điểm Recency (tần suất xuất hiện)
+                recency_score = (stats['total'] / total_occurrences_all_patterns) if total_occurrences_all_patterns > 0 else 0
                 
                 # Trọng số kết hợp độ chính xác lịch sử (70%) và tần suất xuất hiện (30%)
-                weight = 0.7 * accuracy + 0.3 * recency_score
+                # Pattern được nhìn thấy nhiều và có độ chính xác cao sẽ được ưu tiên
+                weight = (0.7 * accuracy) + (0.3 * recency_score)
+                
                 detected_patterns.append({'name': name, 'weight': weight})
         except IndexError:
             continue
+        except Exception as e:
+            logging.error(f"Error detecting pattern {name}: {e}")
+            continue
+
     if not detected_patterns:
         return None
+    
+    # Trả về pattern có trọng số cao nhất
     return max(detected_patterns, key=lambda x: x['weight'])
 
 def predict_with_pattern(app, history_str, detected_pattern_info):
+    """
+    Dự đoán dựa trên pattern, sử dụng thống kê kết quả tiếp theo của pattern đó.
+    """
     if not detected_pattern_info or len(history_str) < 2:
-        return 'Tài', 0.5 # Mặc định trả về Tài với độ tự tin trung bình
-    
-    name = detected_pattern_info['name']
-    last = history_str[-1]
-    prev = history_str[-2]
-    anti_last = 'Xỉu' if last == 'Tài' else 'Tài'
+        return 'Tài', 50.0, "Không có Pattern mạnh" # Mặc định hoặc không dự đoán được
 
-    # Logic dự đoán chi tiết hơn dựa trên loại pattern
-    # Các pattern bệt/theo cầu (theo last result)
-    if any(p in name for p in ["Bệt", "kép", "2-2", "3-3", "4-4", "Nhịp", "Sóng vỗ", "Cầu 3-1", "Cầu 4-1"]):
-        prediction = last 
-    # Các pattern đảo/bẻ cầu (theo anti-last result)
-    elif any(p in name for p in ["Đảo 1-1", "Xen kẽ", "lắc", "Đối ngược", "Bậc thang", "Cầu 1-2-1"]):
-        prediction = anti_last 
-    # Các pattern theo prev result (chu kỳ 2, gãy ngang)
-    elif any(p in name for p in ["Chu kỳ 2", "Gãy ngang", "Cầu lặp"]): # Cầu lặp thường lặp lại 2 kết quả trước
-        prediction = prev
-    # Các pattern chu kỳ xa hơn
-    elif 'Chu kỳ 3' in name:
-        prediction = history_str[-3]
-    elif 'Chu kỳ 4' in name:
-        prediction = history_str[-4]
-    elif name == "Cầu 2-1-2": # T T X T T (predict X)
-        prediction = anti_last if history_str[-1] == history_str[-2] else history_str[-1] # phức tạp hơn, có thể cần điều chỉnh
-    elif name == "Đối xứng (Gương)":
-        prediction = history_str[-3] 
-    else: # Mặc định cho các cầu phức tạp khác là bẻ cầu (an toàn hơn)
-        prediction = anti_last
+    name = detected_pattern_info['name']
+    
+    # Lấy thống kê kết quả tiếp theo cho pattern này
+    p_stats = app.pattern_outcome_stats[name]
+
+    if p_stats['total'] >= 5: # Chỉ sử dụng thống kê nếu có đủ dữ liệu
+        prob_tai = p_stats['Tài'] / p_stats['total']
+        prob_xiu = p_stats['Xỉu'] / p_stats['total']
+
+        if prob_tai > prob_xiu:
+            prediction = 'Tài'
+            confidence = prob_tai * 100
+        elif prob_xiu > prob_tai:
+            prediction = 'Xỉu'
+            confidence = prob_xiu * 100
+        else: # Bằng nhau, chọn ngẫu nhiên hoặc mặc định
+            prediction = random.choice(['Tài', 'Xỉu'])
+            confidence = 50.0
+            
+        reason = f"{name} (Tài:{round(prob_tai*100,1)}%/Xỉu:{round(prob_xiu*100,1)}%)"
+        return prediction, confidence, reason
+    else:
+        # Nếu chưa đủ dữ liệu thống kê cho pattern, quay lại logic dự đoán dựa trên quy tắc cứng (hoặc giảm độ tin cậy)
+        last = history_str[-1]
+        anti_last = 'Xỉu' if last == 'Tài' else 'Tài'
         
-    return prediction, detected_pattern_info['weight']
+        prediction_rules = {
+            "Bệt": last, "kép": last, "2-2": last, "3-3": last, "4-4": last, "Nhịp": last, "Sóng vỗ": last,
+            "Đảo 1-1": anti_last, "Xen kẽ": anti_last, "lắc": anti_last, "Đối ngược": anti_last, "gãy": anti_last, "Bậc thang": anti_last,
+            "Chu kỳ 2": history_str[-2] if len(history_str) >= 2 else anti_last,
+            "Chu kỳ 3": history_str[-3] if len(history_str) >= 3 else anti_last,
+            "Chu kỳ 4": history_str[-4] if len(history_str) >= 4 else anti_last,
+            "Cầu 2-1-2": history_str[-5] if len(history_str) >= 5 else anti_last,
+            "Cầu 1-2-1": anti_last,
+            "Đối xứng (Gương)": history_str[-3] if len(history_str) >= 3 else anti_last,
+            "Cầu lặp": history_str[-3] if len(history_str) >= 3 else anti_last,
+            "Cầu 3-1": last, "Cầu 4-1": last,
+        }
+        
+        prediction = prediction_rules.get(name, anti_last) # Mặc định là bẻ cầu nếu không khớp quy tắc
+        confidence = detected_pattern_info['weight'] * 100 # Độ tin cậy từ trọng số phát hiện pattern
+        reason = f"{name} (Logic tạm thời - chưa đủ dữ liệu thống kê)"
+        
+        return prediction, confidence, reason
+
 
 def get_logistic_features(history_str):
     if not history_str: return [0.0] * 6
         
-    # Feature 1: Current streak length
+    # Feature 1: Current streak length (Độ dài chuỗi hiện tại)
     current_streak = 0
     if len(history_str) > 0:
         last = history_str[-1]
@@ -232,45 +334,42 @@ def get_logistic_features(history_str):
             if history_str[i] == last: current_streak += 1
             else: break
     
-    # Feature 2: Previous streak length
+    # Feature 2: Previous streak length (Độ dài chuỗi trước đó)
     previous_streak_len = 0
     if len(history_str) > current_streak:
         prev_streak_start_idx = len(history_str) - current_streak -1
-        prev_streak_val = history_str[prev_streak_start_idx]
-        previous_streak_len = 1
-        for i in range(prev_streak_start_idx -1, -1, -1):
-            if history_str[i] == prev_streak_val: previous_streak_len += 1
-            else: break
+        if prev_streak_start_idx >= 0:
+            prev_streak_val = history_str[prev_streak_start_idx]
+            previous_streak_len = 1
+            for i in range(prev_streak_start_idx -1, -1, -1):
+                if history_str[i] == prev_streak_val: previous_streak_len += 1
+                else: break
 
     # Feature 3 & 4: Balance (Tài-Xỉu) short-term and long-term
-    recent_history = history_str[-20:]
+    recent_history = history_str[-20:] # 20 kết quả gần nhất
     balance_short = (recent_history.count('Tài') - recent_history.count('Xỉu')) / max(1, len(recent_history))
     
-    long_history = history_str[-100:]
+    long_history = history_str[-100:] # 100 kết quả gần nhất
     balance_long = (long_history.count('Tài') - long_history.count('Xỉu')) / max(1, len(long_history))
     
     # Feature 5: Volatility (tần suất thay đổi)
     changes = sum(1 for i in range(len(recent_history)-1) if recent_history[i] != recent_history[i+1])
     volatility = changes / max(1, len(recent_history) -1) if len(recent_history) > 1 else 0.0
 
-    # Feature 6: Alternation count in last 10 results
+    # Feature 6: Alternation count in last 10 results (Số lần xen kẽ trong 10 kết quả cuối)
     last_10 = history_str[-10:]
     alternations = sum(1 for i in range(len(last_10) - 1) if last_10[i] != last_10[i+1])
     
     return [float(current_streak), float(previous_streak_len), balance_short, balance_long, volatility, float(alternations)]
 
-
-def apply_meta_logic(prediction, confidence, history_str, suggested_pattern_info):
+def apply_meta_logic(prediction, confidence, history_str, suggested_pattern_name):
     """
     Áp dụng logic cấp cao để điều chỉnh dự đoán cuối cùng.
-    Cân nhắc giữa việc bảo toàn dự đoán 100% đúng (bệt hoặc bẻ cầu cực mạnh)
-    và giảm độ tin cậy cho các dự đoán "quá tự tin" không có cơ sở vững chắc.
+    Ví dụ: Logic "bẻ cầu" khi cầu quá dài.
     """
     final_prediction, final_confidence, reason = prediction, confidence, ""
-    suggested_pattern_name = suggested_pattern_info['name'] if suggested_pattern_info else None
-    pattern_weight = suggested_pattern_info['weight'] if suggested_pattern_info else 0.0
 
-    # Tính toán độ dài chuỗi bệt hiện tại
+    # Logic 1: Bẻ cầu khi cầu bệt quá dài (Anti-Streak)
     streak_len = 0
     if len(history_str) > 0:
         last = history_str[-1]
@@ -278,108 +377,92 @@ def apply_meta_logic(prediction, confidence, history_str, suggested_pattern_info
             if x == last: streak_len += 1
             else: break
     
-    # --- Logic 1: Bảo toàn các dự đoán 100% bệt hoặc bẻ cầu cực mạnh ---
-    # Danh sách các pattern "theo cầu" mạnh mà chúng ta muốn tin tưởng ở độ tin cậy cao
-    strong_follow_patterns = ["Bệt", "Bệt siêu dài", "Tài kép", "Xỉu kép", "Nhịp 3-3", "Nhịp 4-4"]
-    is_strong_follow_pattern_detected = suggested_pattern_name and any(p in suggested_pattern_name for p in strong_follow_patterns)
+    # Điều chỉnh độ tin cậy bẻ cầu linh hoạt hơn
+    if streak_len >= 8: # Bắt đầu cân nhắc bẻ cầu từ 8
+        if prediction == history_str[-1]: # Nếu dự đoán vẫn là theo cầu
+            # Tính độ tin cậy bẻ cầu theo hàm sigmoid để nó tăng dần
+            confidence_break = 50 + (50 / (1 + math.exp(-(streak_len - 8) * 0.5))) # Tăng từ 50 lên gần 100 khi streak dài
+            
+            # Chỉ bẻ cầu nếu độ tin cậy của việc bẻ cầu cao hơn độ tin cậy ban đầu
+            if confidence_break > confidence:
+                final_prediction = 'Xỉu' if history_str[-1] == 'Tài' else 'Tài'
+                final_confidence = min(99.0, confidence_break) # Giới hạn 99%
+                reason = f"META-BẺ CẦU: Cầu bệt siêu dài ({streak_len} {history_str[-1]}), độ tin cậy bẻ cầu cao."
+                logging.warning(f"META-LOGIC: Activated Anti-Streak. Streak of {streak_len} detected. Forcing prediction to {final_prediction}.")
+                return final_prediction, final_confidence, reason
+            else:
+                reason = f"Cầu bệt dài ({streak_len} {history_str[-1]}), nhưng độ tin cậy bẻ cầu chưa đủ cao."
+    elif streak_len >= 5: # Giảm nhẹ độ tin cậy nếu cầu khá dài nhưng chưa quá
+        final_confidence = max(50.0, confidence - (streak_len - 4) * 2) # Giảm 2% cho mỗi kết quả thêm sau 4
+        reason = f"Cầu bệt dài ({streak_len}), giảm nhẹ độ tin cậy."
+        
+    # Logic 2: Cân bằng lại nếu Tài/Xỉu quá lệch trong lịch sử dài hạn
+    long_history_str = history_str[-100:]
+    count_tai = long_history_str.count('Tài')
+    count_xiu = long_history_str.count('Xỉu')
 
-    # Danh sách các pattern "bẻ cầu" mạnh mà chúng ta muốn tin tưởng ở độ tin cậy cao
-    # (Bạn cần tự định nghĩa các pattern này dựa trên kinh nghiệm hoặc phân tích dữ liệu)
-    strong_break_patterns = ["Đảo 1-1", "Xen kẽ dài", "Xỉu lắc", "Tài lắc", "Cầu 1-2-1"] 
-    is_strong_break_pattern_detected = suggested_pattern_name and any(p in suggested_pattern_name for p in strong_break_patterns)
+    if len(long_history_str) > 50: # Chỉ áp dụng nếu có đủ dữ liệu
+        tai_ratio = count_tai / len(long_history_str)
+        xiu_ratio = count_xiu / len(long_history_str)
 
-    # Điều kiện để cho phép độ tin cậy 99%+ (gần 100%)
-    allow_high_confidence = False
-    if confidence >= 95.0: # Chỉ xem xét nếu mô hình đã tự tin cao
-        # Trường hợp 1: Dự đoán bệt và là một chuỗi bệt cực dài
-        if prediction == last and streak_len >= 8: # Ví dụ: bệt từ 8 trở lên
-            allow_high_confidence = True
-            reason = f"META-LOGIC: Bảo toàn bệt siêu dài ({streak_len})"
-        # Trường hợp 2: Dự đoán theo một pattern bệt mạnh và độ chính xác lịch sử cao
-        elif is_strong_follow_pattern_detected and prediction == last and pattern_weight > 0.8:
-            allow_high_confidence = True
-            reason = f"META-LOGIC: Bảo toàn dự đoán theo pattern bệt mạnh ({suggested_pattern_name})"
-        # Trường hợp 3: Dự đoán bẻ cầu và là một pattern bẻ cầu mạnh
-        elif is_strong_break_pattern_detected and prediction != last and pattern_weight > 0.8:
-            allow_high_confidence = True
-            reason = f"META-LOGIC: Bảo toàn dự đoán theo pattern bẻ cầu mạnh ({suggested_pattern_name})"
-        # Trường hợp 4: Cầu bệt đã quá dài và dự đoán bẻ cầu
-        elif streak_len >= 10 and prediction != last: # Ví dụ: sau 10 con bệt, khả năng bẻ rất cao
-            allow_high_confidence = True
-            reason = f"META-LOGIC: Bảo toàn bẻ cầu sau bệt cực dài ({streak_len})"
-            # Có thể tăng nhẹ confidence ở đây nếu nó dự đoán bẻ
-            final_confidence = min(99.9, final_confidence + 5.0)
+        if tai_ratio > 0.65 and prediction == 'Tài': # Quá nhiều Tài, có thể sẽ về Xỉu
+            final_prediction = 'Xỉu'
+            final_confidence = max(final_confidence, 70.0) # Tăng độ tin cậy nếu dự đoán này hợp lý
+            reason = "META-CÂN BẰNG: Lịch sử Tài quá cao, có thể về Xỉu."
+            logging.info(f"META-LOGIC: Tài ratio {tai_ratio*100:.1f}%. Forcing prediction to Xỉu.")
+        elif xiu_ratio > 0.65 and prediction == 'Xỉu': # Quá nhiều Xỉu, có thể về Tài
+            final_prediction = 'Tài'
+            final_confidence = max(final_confidence, 70.0)
+            reason = "META-CÂN BẰNG: Lịch sử Xỉu quá cao, có thể về Tài."
+            logging.info(f"META-LOGIC: Xỉu ratio {xiu_ratio*100:.1f}%. Forcing prediction to Tài.")
 
-    # --- Logic 2: Giảm độ tin cậy cho các dự đoán "quá tự tin" không có cơ sở vững chắc ---
-    if final_confidence >= 95.0 and not allow_high_confidence:
-        # Nếu mô hình đang rất tự tin nhưng không rơi vào các trường hợp "chắc chắn" ở trên,
-        # hoặc là một pattern không rõ ràng, thì giảm độ tin cậy.
-        final_confidence = random.uniform(80.0, 95.0) # Giảm xuống một ngưỡng an toàn hơn
-        reason = f"META-LOGIC: Giảm độ tin cậy cho dự đoán quá tự tin ({round(confidence,1)}%) không có cơ sở vững chắc."
-        logging.warning(reason)
-    
-    # Đảm bảo confidence không vượt quá 99.9% để tránh các dự đoán "tuyệt đối" không thực tế,
-    # trừ khi được "allow_high_confidence" ở trên.
-    if not allow_high_confidence:
-        final_confidence = min(final_confidence, 99.9)
-
+    # Nếu không có meta-logic nào được kích hoạt, giữ nguyên dự đoán ban đầu
+    if not reason:
+        reason = suggested_pattern_name if suggested_pattern_name else "Phân tích Ensemble"
 
     return final_prediction, final_confidence, reason
 
 
 def predict_advanced(app, history_str):
     """Hàm điều phối dự đoán nâng cao, kết hợp nhiều mô hình với trọng số động."""
-    # Khi lịch sử quá ngắn, trả về dự đoán sơ bộ và dictionary rỗng cho individual_preds
     if len(history_str) < 5:
-        if len(history_str) < 2:
-             return "Chờ dữ liệu", "Chưa đủ lịch sử", 50.0, {} # Đã thay đổi None thành {}
-        
-        last_result = history_str[-1]
-        anti_last = 'Xỉu' if last_result == 'Tài' else 'Tài'
-        
+        # Nếu chưa đủ dữ liệu để phân tích mẫu hoặc logistic regression
+        # Vẫn có thể sử dụng Markov chain nếu có ít nhất 1 kết quả
         if len(history_str) >= 1:
+            last_result = history_str[-1]
             last_result_idx = 0 if last_result == 'Tài' else 1
             prob_tai_markov = app.transition_matrix[last_result_idx][0]
-            initial_pred = 'Tài' if prob_tai_markov > 0.5 else 'Xỉu'
-            initial_conf = max(prob_tai_markov, 1 - prob_tai_markov) * 100
-            
-            streak_len = 0
-            if len(history_str) > 0:
-                last_val = history_str[-1]
-                for x in reversed(history_str):
-                    if x == last_val: streak_len += 1
-                    else: break
-            
-            if streak_len >= 2 and initial_pred == last_val:
-                return initial_pred, "Theo bệt ngắn", min(initial_conf + 10, 80.0), {} # Đã thay đổi None thành {}
-            else:
-                return anti_last, "Bẻ cầu cơ bản", min(initial_conf + 5, 70.0), {} # Đã thay đổi None thành {}
-        
-        return "Chờ dữ liệu", "Phân tích", 50.0, {} # Đã thay đổi None thành {}
+            markov_pred = 'Tài' if prob_tai_markov > 0.5 else 'Xỉu'
+            markov_conf = max(prob_tai_markov, 1 - prob_tai_markov) * 100
+            return markov_pred, "Markov (thiếu dữ liệu)", markov_conf, {'markov': markov_pred}
+        return "Chờ dữ liệu", "Phân tích", 50.0, {}
 
     last_result = history_str[-1]
 
     # --- Model 1: Pattern Matching ---
     detected_pattern_info = detect_pattern(app, history_str)
-    patt_pred, patt_conf = predict_with_pattern(app, history_str, detected_pattern_info)
-    patt_conf_percent = patt_conf * 100 # Convert to percent
-
+    # pattern_reason sẽ giải thích lý do cụ thể của pattern
+    patt_pred, patt_conf, pattern_reason = predict_with_pattern(app, history_str, detected_pattern_info)
+    
     # --- Model 2: Markov Chain ---
     last_result_idx = 0 if last_result == 'Tài' else 1
     prob_tai_markov = app.transition_matrix[last_result_idx][0]
     markov_pred = 'Tài' if prob_tai_markov > 0.5 else 'Xỉu'
-    markov_conf = max(prob_tai_markov, 1 - prob_tai_markov) * 100 # Convert to percent
+    markov_conf = max(prob_tai_markov, 1 - prob_tai_markov) * 100
 
     # --- Model 3: Logistic Regression ---
     features = get_logistic_features(history_str)
-    z = app.logistic_bias + sum(w * f for w, f in zip(app.logistic_weights, features))
+    # Phải chuẩn hóa features trước khi dùng với Logistic Regression
+    normalized_features = _normalize_features(features)
+    
+    z = app.logistic_bias + sum(w * f for w, f in zip(app.logistic_weights, normalized_features))
     try:
         prob_tai_logistic = 1.0 / (1.0 + math.exp(-z))
     except OverflowError:
         prob_tai_logistic = 0.0 if z < 0 else 1.0
         
     logistic_pred = 'Tài' if prob_tai_logistic > 0.5 else 'Xỉu'
-    logistic_conf = max(prob_tai_logistic, 1 - prob_tai_logistic) * 100 # Convert to percent
+    logistic_conf = max(prob_tai_logistic, 1 - prob_tai_logistic) * 100
     
     # Lưu lại dự đoán của từng mô hình để học
     individual_predictions = {
@@ -390,115 +473,191 @@ def predict_advanced(app, history_str):
 
     # --- Ensemble Prediction (Kết hợp các mô hình với trọng số động) ---
     predictions = {
-        'pattern': {'pred': patt_pred, 'conf': patt_conf_percent, 'weight': app.model_weights['pattern']},
-        'markov': {'pred': markov_pred, 'conf': markov_conf, 'weight': app.model_weights['markov']},
-        'logistic': {'pred': logistic_pred, 'conf': logistic_conf, 'weight': app.model_weights['logistic']},
+        'pattern': {'pred': patt_pred, 'conf': patt_conf / 100, 'weight': app.model_weights['pattern']}, # Chia 100 để đưa conf về 0-1
+        'markov': {'pred': markov_pred, 'conf': markov_conf / 100, 'weight': app.model_weights['markov']},
+        'logistic': {'pred': logistic_pred, 'conf': logistic_conf / 100, 'weight': app.model_weights['logistic']},
     }
     
     tai_score, xiu_score = 0.0, 0.0
     for model in predictions.values():
-        score = (model['conf'] / 100.0) * model['weight'] # Normalize confidence to 0-1 for scoring
+        score = model['conf'] * model['weight'] # Score = Confidence * Weight
         if model['pred'] == 'Tài': tai_score += score
         else: xiu_score += score
 
-    final_prediction = 'Tài' if tai_score > xiu_score else 'Xỉu'
+    final_prediction = 'Tài' if tai_score >= xiu_score else 'Xỉu' # Ưu tiên Tài nếu bằng điểm
     total_score = tai_score + xiu_score
     final_confidence = (max(tai_score, xiu_score) / total_score * 100) if total_score > 0 else 50.0
     
-    # Tăng độ tin cậy nếu pattern mạnh nhất trùng với dự đoán cuối cùng
-    # và pattern đó có độ chính xác lịch sử cao
+    # Tăng độ tin cậy nếu pattern mạnh nhất trùng với dự đoán cuối cùng VÀ pattern đó có độ tin cậy cao
     if detected_pattern_info and detected_pattern_info['weight'] > 0.6 and patt_pred == final_prediction:
-        final_confidence = min(98.0, final_confidence + (patt_conf * 10)) # Tăng thêm dựa trên confidence của pattern
+        final_confidence = min(98.0, final_confidence + (patt_conf * 0.1)) # Tăng thêm 10% conf của pattern vào tổng
 
     # Áp dụng logic meta cuối cùng
-    final_prediction, final_confidence, meta_reason = apply_meta_logic(final_prediction, final_confidence, history_str, detected_pattern_info) # Pass the full info
+    # pattern_reason (tên pattern + thống kê) sẽ là lý do được truyền vào ban đầu
+    final_prediction, final_confidence, meta_reason = apply_meta_logic(final_prediction, final_confidence, history_str, pattern_reason)
 
-    used_pattern_name = detected_pattern_info['name'] if detected_pattern_info else "Ensemble"
-    if meta_reason:
-        used_pattern_name = meta_reason # Hiển thị lý do meta-logic nếu có
+    # Nếu meta_reason không có, sử dụng pattern_reason hoặc mặc định
+    final_suggested_pattern = meta_reason if meta_reason else (pattern_reason if detected_pattern_info else "Phân tích Ensemble")
 
-    return final_prediction, used_pattern_name, final_confidence, individual_predictions
+    # Thêm thông tin chi tiết về pattern và balance
+    pattern_details = {
+        "detected_pattern_name": detected_pattern_info['name'] if detected_pattern_info else "N/A",
+        "pattern_weight": round(detected_pattern_info['weight'] * 100, 1) if detected_pattern_info else 0.0,
+        "pattern_stats": app.pattern_outcome_stats.get(detected_pattern_info['name'], {}) if detected_pattern_info else {},
+        "current_streak_length": features[0],
+        "balance_short_term": round(features[2]*100,1),
+        "balance_long_term": round(features[3]*100,1)
+    }
+
+    return final_prediction, final_suggested_pattern, final_confidence, individual_predictions, pattern_details
 
 # --- END: Improved Logic ---
+
+# --- Persistent Storage (Lưu/Tải trạng thái mô hình) ---
+MODEL_STATE_FILE = 'model_state.json'
+
+def save_model_state(app):
+    state = {
+        'history': list(app.history),
+        'session_ids': list(app.session_ids),
+        'transition_matrix': app.transition_matrix,
+        'transition_counts': app.transition_counts,
+        'logistic_weights': app.logistic_weights,
+        'logistic_bias': app.logistic_bias,
+        'model_weights': app.model_weights,
+        'model_performance': dict(app.model_performance), # Convert defaultdict to dict
+        'pattern_accuracy': dict(app.pattern_accuracy),
+        'pattern_outcome_stats': dict(app.pattern_outcome_stats),
+        'last_prediction': app.last_prediction
+    }
+    try:
+        with open(MODEL_STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=4)
+        logging.info("Model state saved successfully.")
+    except Exception as e:
+        logging.error(f"Error saving model state: {e}")
+
+def load_model_state(app):
+    if os.path.exists(MODEL_STATE_FILE):
+        try:
+            with open(MODEL_STATE_FILE, 'r') as f:
+                state = json.load(f)
+            app.history = deque(state.get('history', []), maxlen=app.MAX_HISTORY_LEN)
+            app.session_ids = deque(state.get('session_ids', []), maxlen=app.MAX_HISTORY_LEN)
+            app.transition_matrix = state.get('transition_matrix', [[0.5, 0.5], [0.5, 0.5]])
+            app.transition_counts = state.get('transition_counts', [[0, 0], [0, 0]])
+            app.logistic_weights = state.get('logistic_weights', [0.0] * 6)
+            app.logistic_bias = state.get('logistic_bias', 0.0)
+            app.model_weights = state.get('model_weights', app.default_model_weights.copy())
+            
+            # Convert back to defaultdict
+            app.model_performance = defaultdict(lambda: {"success": 0, "total": 0}, state.get('model_performance', {}))
+            app.pattern_accuracy = defaultdict(lambda: {"success": 0, "total": 0}, state.get('pattern_accuracy', {}))
+            app.pattern_outcome_stats = defaultdict(lambda: {'Tài': 0, 'Xỉu': 0, 'total': 0}, state.get('pattern_outcome_stats', {}))
+            app.last_prediction = state.get('last_prediction', None)
+            logging.info("Model state loaded successfully.")
+        except Exception as e:
+            logging.error(f"Error loading model state: {e}. Starting with default state.")
+            # Reset to default if loading fails
+            app.history = deque(maxlen=app.MAX_HISTORY_LEN)
+            app.session_ids = deque(maxlen=app.MAX_HISTORY_LEN)
+            app.transition_matrix = [[0.5, 0.5], [0.5, 0.5]]
+            app.transition_counts = [[0, 0], [0, 0]]
+            app.logistic_weights = [0.0] * 6
+            app.logistic_bias = 0.0
+            app.model_weights = app.default_model_weights.copy()
+            app.model_performance = {name: {"success": 0, "total": 0} for name in app.model_weights}
+            app.pattern_accuracy = defaultdict(lambda: {"success": 0, "total": 0})
+            app.pattern_outcome_stats = defaultdict(lambda: {'Tài': 0, 'Xỉu': 0, 'total': 0})
+            app.last_prediction = None
+    else:
+        logging.info("No saved model state found. Starting with default state.")
 
 
 # --- Flask App Factory ---
 def create_app():
     app = Flask(__name__)
-    CORS(app) # Cho phép Cross-Origin Resource Sharing để frontend có thể gọi API
+    CORS(app)
 
     # --- Khởi tạo State ---
-    app.lock = threading.Lock() # Khóa để đảm bảo an toàn luồng khi truy cập dữ liệu chung
-    app.MAX_HISTORY_LEN = 200 # Giới hạn độ dài lịch sử để tránh tiêu tốn bộ nhớ
-
-    # Sử dụng deque (double-ended queue) để quản lý lịch sử hiệu quả
+    app.lock = threading.Lock()
+    app.MAX_HISTORY_LEN = 500 # Tăng độ dài lịch sử
+    
     app.history = deque(maxlen=app.MAX_HISTORY_LEN)
     app.session_ids = deque(maxlen=app.MAX_HISTORY_LEN)
     
-    # State cho các thuật toán dự đoán
-    app.patterns = define_patterns() # Tải các pattern đã định nghĩa
-    app.transition_matrix = [[0.5, 0.5], [0.5, 0.5]] # Ma trận chuyển đổi Markov ban đầu
-    app.transition_counts = [[0, 0], [0, 0]] # Đếm số lần chuyển đổi
-    app.logistic_weights = [0.0] * 6 # Khởi tạo trọng số cho Logistic Regression (tùy thuộc vào số lượng features)
-    app.logistic_bias = 0.0 # Bias cho Logistic Regression
-    app.learning_rate = 0.01 # Tốc độ học cho Logistic Regression
-    app.regularization = 0.01 # Tham số regularization để tránh overfitting
-
+    # State cho các thuật toán
+    app.patterns = define_patterns()
+    app.transition_matrix = [[0.5, 0.5], [0.5, 0.5]] # Tài -> Tài, Tài -> Xỉu; Xỉu -> Tài, Xỉu -> Xỉu
+    app.transition_counts = [[0, 0], [0, 0]]
+    app.logistic_weights = [0.0] * 6 # Mở rộng cho 6 features
+    app.logistic_bias = 0.0
+    app.learning_rate = 0.005 # Tinh chỉnh tốc độ học
+    app.regularization = 0.005 # Tinh chỉnh hệ số chính quy hóa
+    
     # State cho ensemble model động
-    app.default_model_weights = {'pattern': 0.5, 'markov': 0.2, 'logistic': 0.3} # Trọng số mặc định
-    app.model_weights = app.default_model_weights.copy() # Trọng số hiện tại (sẽ được cập nhật động)
-    app.model_performance = {name: {"success": 0, "total": 0} for name in app.model_weights} # Ghi lại hiệu suất từng mô hình con
+    app.default_model_weights = {'pattern': 0.4, 'markov': 0.3, 'logistic': 0.3} # Tùy chỉnh trọng số mặc định
+    app.model_weights = app.default_model_weights.copy()
+    app.model_performance = defaultdict(lambda: {"success": 0, "total": 0}, {name: {"success": 0, "total": 0} for name in app.model_weights})
 
-    app.last_prediction = None # Lưu dự đoán cuối cùng để sử dụng cho online learning
-    app.pattern_accuracy = defaultdict(lambda: {"success": 0, "total": 0}) # Ghi lại độ chính xác của từng pattern
+    app.last_prediction = None
+    app.pattern_accuracy = defaultdict(lambda: {"success": 0, "total": 0})
+    # Thêm state để lưu thống kê kết quả tiếp theo cho mỗi pattern
+    app.pattern_outcome_stats = defaultdict(lambda: {'Tài': 0, 'Xỉu': 0, 'total': 0})
 
+    # Tải trạng thái mô hình khi khởi động
+    load_model_state(app)
+    
     # --- Xử lý API HTTP ---
-    # Cập nhật API_URL thành API mới
-    # Đọc API_URL từ biến môi trường, hoặc dùng mặc định nếu không có
     app.API_URL = os.getenv("API_URL", "https://sunwinwanglin.up.railway.app/api/sunwin?key=WangLinID99")
 
     def fetch_data_from_api():
-        """Hàm lấy dữ liệu lịch sử từ API bên ngoài."""
         try:
-            response = requests.get(app.API_URL, timeout=5) # Đặt timeout để tránh treo
-            response.raise_for_status()  # Ném ngoại lệ cho lỗi HTTP (4xx hoặc 5xx)
+            response = requests.get(app.API_URL, timeout=8) # Tăng timeout
+            response.raise_for_status()  # Raise an exception for HTTP errors
             data = response.json()
             return data
         except requests.exceptions.RequestException as e:
             logging.error(f"Error fetching data from API: {e}")
             return None
+        except json.JSONDecodeError as e:
+            logging.error(f"Error decoding JSON from API: {e}. Response content: {response.text}")
+            return None
+
 
     def data_fetch_loop():
-        """Vòng lặp chạy ngầm để liên tục lấy dữ liệu mới từ API."""
-        last_processed_session_api = None # Theo dõi phiên cuối cùng nhận từ API
+        last_processed_session = None
         while True:
             data = fetch_data_from_api()
             if data:
                 try:
-                    # Trích xuất phien_truoc và ket_qua từ API mới
                     phien_truoc = data.get("phien_truoc")
                     ket_qua = data.get("ket_qua")
 
                     if phien_truoc is None or ket_qua not in ["Tài", "Xỉu"]:
                         logging.warning(f"Invalid data received from API: {data}")
-                        time.sleep(1) # Chờ một chút trước khi thử lại
+                        time.sleep(2) # Wait a bit before retrying
                         continue
 
-                    # Tính toán phien_hien_tai (phiên vừa kết thúc)
-                    phien_hien_tai = phien_truoc + 1
+                    # phien_hien_tai là phiên kết quả vừa nhận được
+                    phien_hien_tai = phien_truoc
 
-                    with app.lock: # Đảm bảo an toàn luồng khi cập nhật lịch sử
-                        # Chỉ thêm dữ liệu mới nếu phiên hiện tại nhận được từ API lớn hơn phiên cuối cùng trong lịch sử của app
-                        # Hoặc nếu lịch sử rỗng
+                    with app.lock:
+                        # Kiểm tra xem phiên này đã được xử lý chưa
                         if not app.session_ids or phien_hien_tai > app.session_ids[-1]:
+                            # Chỉ thêm nếu là phiên mới nhất
                             app.session_ids.append(phien_hien_tai)
                             app.history.append({'ket_qua': ket_qua, 'phien': phien_hien_tai})
-                            logging.info(f"New result for session {phien_hien_tai}: {ket_qua}")
-                            last_processed_session_api = phien_hien_tai
+                            logging.info(f"New result for session {phien_hien_tai}: {ket_qua}. History length: {len(app.history)}")
+                            last_processed_session = phien_hien_tai
+                            
+                            # Lưu trạng thái sau mỗi khi có dữ liệu mới quan trọng
+                            save_model_state(app)
+
                         else:
-                            # Nếu phiên đã có trong lịch sử hoặc cũ hơn, bỏ qua
+                            # Nếu phiên đã có hoặc cũ hơn, không làm gì
                             if phien_hien_tai == app.session_ids[-1]:
-                                logging.debug(f"Session {phien_hien_tai} already processed.")
+                                logging.debug(f"Session {phien_hien_tai} already processed. Waiting for next.")
                             else:
                                 logging.debug(f"Received older session {phien_hien_tai}. Current latest is {app.session_ids[-1]}.")
                 except (json.JSONDecodeError, TypeError) as e:
@@ -506,101 +665,128 @@ def create_app():
                 except Exception as e:
                     logging.error(f"Unexpected error in data_fetch_loop: {e}")
             
-            time.sleep(1) # Poll the API mỗi 1 giây
+            time.sleep(1) # Poll the API every 1 second
 
     # --- API Endpoints ---
     @app.route("/api/taixiu_ws", methods=["GET"])
     def get_taixiu_prediction():
-        with app.lock: # Khóa để đảm bảo dữ liệu lịch sử không bị thay đổi trong quá trình xử lý request
-            if len(app.history) < 2:
-                # Trả về lỗi hoặc trạng thái "chờ dữ liệu" nếu lịch sử quá ngắn
-                return jsonify({"error": "Chưa có đủ dữ liệu", "prediction": "Đang phân tích", "confidence_percent": 50.0, "suggested_pattern": "Chưa đủ lịch sử"}), 500
-            
-            history_copy = list(app.history) # Tạo bản sao lịch sử để thao tác
+        with app.lock:
+            # Lấy bản sao của lịch sử và các biến state để xử lý mà không bị khóa quá lâu
+            history_copy = list(app.history)
             session_ids_copy = list(app.session_ids)
-            last_prediction_copy = app.last_prediction
+            last_prediction_data = app.last_prediction # Lấy bản sao của last_prediction
+
+        # Lấy kết quả thực tế của phiên cuối cùng để học
+        actual_result = None
+        if history_copy:
+            actual_result = history_copy[-1]['ket_qua']
         
         # --- Bước học Online (Online Learning) ---
-        # Chỉ học nếu có một kết quả mới từ phiên mà chúng ta đã dự đoán trước đó
-        # (tức là phiên hiện tại của lịch sử là phiên mà chúng ta đã dự đoán)
-        if last_prediction_copy and session_ids_copy and last_prediction_copy['session'] == session_ids_copy[-1]:
-            prev_history_str = _get_history_strings(history_copy[:-1]) # Lịch sử trước kết quả hiện tại
-            actual_result = history_copy[-1]['ket_qua'] # Kết quả thực tế của phiên đã dự đoán
+        # Chỉ học nếu có dự đoán trước đó và phiên của dự đoán đó khớp với phiên vừa có kết quả
+        if last_prediction_data and actual_result and session_ids_copy and \
+           last_prediction_data['session'] == session_ids_copy[-1]:
+            
+            # Lịch sử tại thời điểm dự đoán (trừ đi kết quả cuối cùng vừa nhận)
+            history_at_prediction_time = _get_history_strings(history_copy[:-1])
 
-            with app.lock: # Khóa khi cập nhật các tham số mô hình
-                # Học cho Logistic Regression
-                train_logistic_regression(app, last_prediction_copy['features'], actual_result)
-                # Học cho Markov Chain
-                if len(prev_history_str) > 0:
-                     update_transition_matrix(app, prev_history_str[-1], actual_result)
-                # Học cho Pattern
-                update_pattern_accuracy(app, last_prediction_copy['pattern_name_for_learning'], last_prediction_copy['prediction'], actual_result)
+            with app.lock: # Khóa lại khi cập nhật state của các mô hình
+                # Học cho Logistic Regression (sử dụng features tại thời điểm dự đoán)
+                train_logistic_regression(app, last_prediction_data['features'], actual_result)
                 
-                # SỬA LỖI: Thêm kiểm tra None cho 'individual_predictions'
-                # Đảm bảo last_prediction_copy.get('individual_predictions') không phải là None
-                if last_prediction_copy.get('individual_predictions') is not None:
-                    for model_name, model_pred in last_prediction_copy['individual_predictions'].items():
-                        app.model_performance[model_name]['total'] += 1
-                        if model_pred == actual_result:
-                            app.model_performance[model_name]['success'] += 1
-                else:
-                    logging.warning(f"individual_predictions was None for session {session_ids_copy[-1]}. Skipping model performance update.")
+                # Học cho Markov Chain
+                if len(history_at_prediction_time) > 0:
+                     update_transition_matrix(app, history_at_prediction_time[-1], actual_result)
+                
+                # Học cho Pattern (phải truyền lịch sử tại thời điểm phát hiện pattern)
+                # pattern_at_prediction_time là tên pattern đã được phát hiện ở lần dự đoán trước
+                update_pattern_accuracy(app, last_prediction_data['pattern_name'], actual_result, history_at_prediction_time)
+                
+                # Cập nhật hiệu suất của từng mô hình con để điều chỉnh trọng số ensemble
+                for model_name, model_pred in last_prediction_data['individual_predictions'].items():
+                    app.model_performance[model_name]['total'] += 1
+                    if model_pred == actual_result:
+                        app.model_performance[model_name]['success'] += 1
                 
                 # Cập nhật lại trọng số của ensemble model
                 update_model_weights(app)
 
-            logging.info(f"Learned from session {session_ids_copy[-1]}. Prediction was {last_prediction_copy['prediction']}, actual was {actual_result}. Pattern: {last_prediction_copy['pattern_name_for_learning']}")
+            logging.info(f"Learned from session {session_ids_copy[-1]}. Prediction was {last_prediction_data['prediction']}, actual was {actual_result}. Pattern: {last_prediction_data['pattern_name']}")
+            
+        # --- Bước Dự đoán (Prediction) cho phiên TIẾP THEO ---
+        if len(history_copy) < 1: # Ít nhất phải có 1 kết quả để biết phiên hiện tại
+             return jsonify({
+                "error": "Chưa có đủ dữ liệu lịch sử để dự đoán.",
+                "current_session": None,
+                "current_result": None,
+                "next_session": None,
+                "prediction": "Chờ dữ liệu",
+                "confidence_percent": 0.0,
+                "suggested_pattern": "Đang tải dữ liệu...",
+            }), 200 # Trả về 200 vì đây không phải lỗi server mà là thiếu dữ liệu
 
-        # --- Bước Dự đoán (Prediction) ---
         history_str_for_prediction = _get_history_strings(history_copy)
-        prediction_str, pattern_str, confidence, individual_preds = predict_advanced(app, history_str_for_prediction)
+        
+        # current_session là phiên cuối cùng đã có kết quả
+        current_session = session_ids_copy[-1] if session_ids_copy else None 
+        # next_session là phiên sẽ dự đoán
+        next_session = current_session + 1 if current_session is not None else None
+
+        # Thực hiện dự đoán
+        prediction_str, suggested_pattern, confidence, individual_preds, pattern_details = \
+            predict_advanced(app, history_str_for_prediction)
         
         # Lưu lại thông tin dự đoán để học ở lần tiếp theo
         with app.lock:
-            # Phiên dự đoán tiếp theo sẽ là phiên sau phiên cuối cùng trong lịch sử hiện tại
-            current_session_in_history = session_ids_copy[-1] if session_ids_copy else None 
-            next_session_to_predict = current_session_in_history + 1 if current_session_in_history is not None else None
-            
-            if next_session_to_predict is not None:
-                app.last_prediction = {
-                    'session': next_session_to_predict, # Phiên mà chúng ta đang dự đoán
-                    'prediction': prediction_str,
-                    'pattern_name_for_learning': pattern_str, # Lưu tên pattern để học
-                    'features': get_logistic_features(history_str_for_prediction),
-                    'individual_predictions': individual_preds, # Đảm bảo rằng individual_preds không phải là None
-                }
-            current_result = history_copy[-1]['ket_qua'] if history_copy else None
+            app.last_prediction = {
+                'session': next_session, # Đây là phiên mà dự đoán này áp dụng
+                'prediction': prediction_str,
+                'pattern_name': pattern_details['detected_pattern_name'], # Lưu tên pattern chính để học
+                'features': get_logistic_features(history_str_for_prediction), # Lưu features tại thời điểm dự đoán
+                'individual_predictions': individual_preds, # Dự đoán của từng mô hình
+            }
         
-        # Tinh chỉnh hiển thị: Nếu độ tin cậy thấp, hiển thị "Đang phân tích"
-        prediction_display = prediction_str
+        # Tinh chỉnh hiển thị độ tin cậy và lý do
         final_confidence_display = round(confidence, 1)
 
-        # Điều kiện để hiển thị "Đang phân tích"
-        # - Lịch sử quá ngắn (dưới 5)
-        # - Confidence thấp (dưới 65%) VÀ không phải là một pattern mạnh được tin cậy
-        if len(history_str_for_prediction) < 5 or (final_confidence < 65.0 and "Bẻ cầu" not in pattern_str and "Theo bệt" not in pattern_str):
-            prediction_display = f"Đang phân tích"
-            final_confidence_display = round(final_confidence, 1)
+        # Quyết định hiển thị "Đang phân tích"
+        display_prediction = prediction_str
+        display_suggested_pattern = suggested_pattern
+        if confidence < 60.0: # Ngưỡng để hiển thị "Đang phân tích"
+            display_prediction = "Đang phân tích"
+            display_suggested_pattern = "Chưa có cầu rõ rệt / Đang cân nhắc"
+            final_confidence_display = round(confidence, 1) # Vẫn hiển thị % tin cậy thấp
 
         return jsonify({
-            "current_session": current_session_in_history,
-            "current_result": current_result,
-            "next_session": next_session_to_predict,
-            "prediction": prediction_display,
-            "confidence_percent": final_confidence_display,
-            "suggested_pattern": pattern_str,
+            "current_session": current_session,
+            "current_result": actual_result, # Kết quả của phiên hiện tại
+            "next_session_id": next_session, # Phiên mà dự đoán này áp dụng
+            "prediction": display_prediction, # Dự đoán cuối cùng
+            "confidence_percent": final_confidence_display, # Độ tin cậy
+            "suggested_pattern": display_suggested_pattern, # Lý do / Pattern gợi ý
+            "detail_info": { # Thông tin chi tiết hơn giống ảnh
+                "pattern_info": {
+                    "name": pattern_details['detected_pattern_name'],
+                    "weight_percent": pattern_details['pattern_weight'],
+                    "outcome_stats": pattern_details['pattern_stats']
+                },
+                "current_streak_length": int(pattern_details['current_streak_length']),
+                "balance_short_term_percent": int(pattern_details['balance_short_term']),
+                "balance_long_term_percent": int(pattern_details['balance_long_term']),
+                "individual_model_predictions": {k: f"{v} ({round(app.model_performance[k]['success']/max(1, app.model_performance[k]['total'])*100, 1)}% acc)" 
+                                                 for k,v in individual_preds.items()}, # Thêm độ chính xác của từng model
+            }
         })
 
     @app.route("/api/history", methods=["GET"])
     def get_history_api():
-        """Endpoint để lấy lịch sử kết quả."""
         with app.lock:
             hist_copy = list(app.history)
-        return jsonify({"history": hist_copy, "length": len(hist_copy)})
+            # Tạo danh sách các chuỗi "Tài" hoặc "Xỉu" cho lịch sử gần nhất
+            recent_history_strings = _get_history_strings(hist_copy[-50:]) # Lấy 50 kết quả gần nhất để hiển thị
+        return jsonify({"history": hist_copy, "recent_history_string": recent_history_strings, "length": len(hist_copy)})
 
     @app.route("/api/performance", methods=["GET"])
     def get_performance():
-        """Endpoint để lấy hiệu suất của các pattern và mô hình con."""
         with app.lock:
             # Sắp xếp pattern theo tổng số lần xuất hiện và độ chính xác
             seen_patterns = {k: v for k, v in app.pattern_accuracy.items() if v['total'] > 0}
@@ -610,9 +796,24 @@ def create_app():
                 reverse=True
             )
             pattern_result = {}
-            for p_type, data in sorted_patterns[:30]: # Lấy 30 pattern hàng đầu
+            for p_type, data in sorted_patterns[:50]: # Lấy 50 pattern hàng đầu
                 accuracy = round(data["success"] / data["total"] * 100, 2) if data["total"] > 0 else 0
-                pattern_result[p_type] = { "total": data["total"], "success": data["success"], "accuracy_percent": accuracy }
+                outcome_stats = app.pattern_outcome_stats.get(p_type, {'Tài': 0, 'Xỉu': 0, 'total': 0})
+                prob_tai_next = round(outcome_stats['Tài'] / outcome_stats['total'] * 100, 1) if outcome_stats['total'] > 0 else 0.0
+                prob_xiu_next = round(outcome_stats['Xỉu'] / outcome_stats['total'] * 100, 1) if outcome_stats['total'] > 0 else 0.0
+
+                pattern_result[p_type] = { 
+                    "total_matches": data["total"], 
+                    "successful_predictions": data["success"], 
+                    "accuracy_percent": accuracy,
+                    "next_outcome_stats": {
+                        "Tài": outcome_stats['Tài'],
+                        "Xỉu": outcome_stats['Xỉu'],
+                        "total_next_outcomes": outcome_stats['total'],
+                        "prob_tai_next_percent": prob_tai_next,
+                        "prob_xiu_next_percent": prob_xiu_next
+                    }
+                }
             
             # Lấy hiệu suất của các mô hình con
             model_perf_result = {}
@@ -620,14 +821,31 @@ def create_app():
                  accuracy = round(perf["success"] / perf["total"] * 100, 2) if perf["total"] > 0 else 0
                  model_perf_result[name] = {**perf, "accuracy_percent": accuracy}
 
+            # Thông tin thêm về Logistic Regression
+            logistic_info = {
+                "weights": [round(w, 4) for w in app.logistic_weights],
+                "bias": round(app.logistic_bias, 4),
+                "learning_rate": app.learning_rate,
+                "regularization": app.regularization
+            }
+
+            # Thông tin Markov Chain
+            markov_info = {
+                "transition_matrix": [[round(val, 4) for val in row] for row in app.transition_matrix],
+                "transition_counts": app.transition_counts
+            }
+
+
         return jsonify({
             "pattern_performance": pattern_result,
             "model_performance": model_perf_result,
-            "model_weights": app.model_weights
+            "ensemble_model_weights": app.model_weights,
+            "logistic_regression_details": logistic_info,
+            "markov_chain_details": markov_info,
+            "total_history_length": len(app.history)
         })
 
     # Start the HTTP data fetching thread
-    # Đảm bảo luồng này chạy ngầm và không chặn luồng chính của Flask
     api_fetch_thread = threading.Thread(target=data_fetch_loop, daemon=True)
     api_fetch_thread.start()
     return app
@@ -636,9 +854,8 @@ def create_app():
 app = create_app()
 
 if __name__ == "__main__":
-    # Lấy cổng từ biến môi trường (cần thiết cho các nền tảng cloud như Render)
     port = int(os.environ.get("PORT", 8080))
     logging.info(f"Flask app ready. Serving on http://0.0.0.0:{port}")
-    # Sử dụng Waitress để phục vụ Flask app một cách ổn định trong môi trường production
+    # Sử dụng Waitress cho môi trường production
     from waitress import serve
-    serve(app, host="0.0.0.0", port=port, threads=8)
+    serve(app, host="0.0.0.0", port=port, threads=10) # Tăng threads để xử lý nhiều request hơn
