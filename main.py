@@ -653,7 +653,7 @@ def create_app():
 
     # --- Khởi tạo State ---
     app.lock = threading.Lock()
-    app.MAX_HISTORY_LEN = 500 # Tăng độ dài lịch sử
+    app.MAX_HISTORY_LEN = 1000 # Tăng độ dài lịch sử
     
     app.history = deque(maxlen=app.MAX_HISTORY_LEN)
     app.session_ids = deque(maxlen=app.MAX_HISTORY_LEN)
