@@ -258,62 +258,70 @@ def get_logistic_features(history_str):
     
     return [float(current_streak), float(previous_streak_len), balance_short, balance_long, volatility, float(alternations)]
 
-def apply_meta_logic(prediction, confidence, history_str, suggested_pattern_name):
+
+def apply_meta_logic(prediction, confidence, history_str, suggested_pattern_info):
     """
     Áp dụng logic cấp cao để điều chỉnh dự đoán cuối cùng.
-    Ví dụ: Logic "bẻ cầu" khi cầu quá dài.
-    Cũng dùng để giảm độ tin cậy nếu có dấu hiệu dự đoán sai dù tự tin cao.
+    Cân nhắc giữa việc bảo toàn dự đoán 100% đúng (bệt hoặc bẻ cầu cực mạnh)
+    và giảm độ tin cậy cho các dự đoán "quá tự tin" không có cơ sở vững chắc.
     """
     final_prediction, final_confidence, reason = prediction, confidence, ""
+    suggested_pattern_name = suggested_pattern_info['name'] if suggested_pattern_info else None
+    pattern_weight = suggested_pattern_info['weight'] if suggested_pattern_info else 0.0
 
-    # Logic 1: Phát hiện và xử lý cầu bệt siêu dài (Đảm bảo bệt vẫn hoạt động tốt)
+    # Tính toán độ dài chuỗi bệt hiện tại
     streak_len = 0
-    if len(history_str) > 0: # Đảm bảo có ít nhất 1 kết quả
+    if len(history_str) > 0:
         last = history_str[-1]
         for x in reversed(history_str):
             if x == last: streak_len += 1
             else: break
     
-    # Nếu là cầu bệt cực kỳ dài và dự đoán vẫn là theo bệt, tăng cường độ tin cậy
-    if streak_len >= 9 and prediction == history_str[-1]:
-        final_confidence = min(99.0, confidence + 5) # Tăng nhẹ độ tin cậy cho bệt rất dài
-        reason = f"Theo cầu bệt siêu dài ({streak_len})"
-        logging.info(f"META-LOGIC: Confirmed super long streak of {streak_len}. Confidence increased.")
-    # Nếu cầu bệt dài nhưng mô hình lại dự đoán bẻ (điều này ít xảy ra nếu pattern bệt hoạt động tốt)
-    elif streak_len >= 7 and prediction != history_str[-1]:
-        # Giảm độ tin cậy của việc bẻ nếu cầu vẫn đang rất dài
-        final_confidence = max(50.0, confidence - 15) 
-        reason = f"Cầu bệt dài ({streak_len}), dự đoán bẻ, giảm độ tin cậy"
-        logging.warning(f"META-LOGIC: Long streak of {streak_len} detected, but prediction is against it. Reducing confidence.")
-    
-    # Logic 2: Giảm độ tin cậy cho các dự đoán "quá tự tin" không dựa trên bệt rõ ràng
-    # Đây là phần quan trọng để xử lý lỗi "100% sai"
-    # Giả định rằng các pattern bệt (Bệt, Bệt siêu dài...) được tin cậy cao
-    # và các pattern khác có thể không đủ mạnh để đạt 100% chính xác
-    
+    # --- Logic 1: Bảo toàn các dự đoán 100% bệt hoặc bẻ cầu cực mạnh ---
     # Danh sách các pattern "theo cầu" mạnh mà chúng ta muốn tin tưởng ở độ tin cậy cao
     strong_follow_patterns = ["Bệt", "Bệt siêu dài", "Tài kép", "Xỉu kép", "Nhịp 3-3", "Nhịp 4-4"]
+    is_strong_follow_pattern_detected = suggested_pattern_name and any(p in suggested_pattern_name for p in strong_follow_patterns)
 
-    is_strong_follow_pattern = False
-    if suggested_pattern_name:
-        for p_name in strong_follow_patterns:
-            if p_name in suggested_pattern_name:
-                is_strong_follow_pattern = True
-                break
+    # Danh sách các pattern "bẻ cầu" mạnh mà chúng ta muốn tin tưởng ở độ tin cậy cao
+    # (Bạn cần tự định nghĩa các pattern này dựa trên kinh nghiệm hoặc phân tích dữ liệu)
+    strong_break_patterns = ["Đảo 1-1", "Xen kẽ dài", "Xỉu lắc", "Tài lắc", "Cầu 1-2-1"] 
+    is_strong_break_pattern_detected = suggested_pattern_name and any(p in suggested_pattern_name for p in strong_break_patterns)
 
-    # Nếu độ tin cậy rất cao (>90%) nhưng KHÔNG phải là một pattern "bệt/theo cầu" mạnh đã xác nhận,
-    # thì có thể đây là một dự đoán "quá tự tin" và cần giảm ngưỡng.
-    if final_confidence >= 90.0 and not is_strong_follow_pattern:
-        # Nếu prediction hiện tại không phải là theo kết quả gần nhất (tức là bẻ cầu hoặc đảo)
-        # Hoặc nếu nó là theo nhưng không phải pattern bệt rõ ràng
-        if prediction != history_str[-1] or (prediction == history_str[-1] and streak_len < 3):
-            # Giảm độ tin cậy xuống một ngưỡng an toàn, ví dụ 75-85%
-            final_confidence = random.uniform(75.0, 85.0) 
-            reason = f"META-LOGIC: Giảm độ tin cậy cho dự đoán quá tự tin ({round(confidence,1)}%) không phải cầu bệt rõ ràng."
-            logging.warning(reason)
+    # Điều kiện để cho phép độ tin cậy 99%+ (gần 100%)
+    allow_high_confidence = False
+    if confidence >= 95.0: # Chỉ xem xét nếu mô hình đã tự tin cao
+        # Trường hợp 1: Dự đoán bệt và là một chuỗi bệt cực dài
+        if prediction == last and streak_len >= 8: # Ví dụ: bệt từ 8 trở lên
+            allow_high_confidence = True
+            reason = f"META-LOGIC: Bảo toàn bệt siêu dài ({streak_len})"
+        # Trường hợp 2: Dự đoán theo một pattern bệt mạnh và độ chính xác lịch sử cao
+        elif is_strong_follow_pattern_detected and prediction == last and pattern_weight > 0.8:
+            allow_high_confidence = True
+            reason = f"META-LOGIC: Bảo toàn dự đoán theo pattern bệt mạnh ({suggested_pattern_name})"
+        # Trường hợp 3: Dự đoán bẻ cầu và là một pattern bẻ cầu mạnh
+        elif is_strong_break_pattern_detected and prediction != last and pattern_weight > 0.8:
+            allow_high_confidence = True
+            reason = f"META-LOGIC: Bảo toàn dự đoán theo pattern bẻ cầu mạnh ({suggested_pattern_name})"
+        # Trường hợp 4: Cầu bệt đã quá dài và dự đoán bẻ cầu
+        elif streak_len >= 10 and prediction != last: # Ví dụ: sau 10 con bệt, khả năng bẻ rất cao
+            allow_high_confidence = True
+            reason = f"META-LOGIC: Bảo toàn bẻ cầu sau bệt cực dài ({streak_len})"
+            # Có thể tăng nhẹ confidence ở đây nếu nó dự đoán bẻ
+            final_confidence = min(99.9, final_confidence + 5.0)
 
-    # Đảm bảo confidence không vượt quá 99.9% để tránh các dự đoán "tuyệt đối" không thực tế, trừ bệt cực dài
-    final_confidence = min(final_confidence, 99.9)
+    # --- Logic 2: Giảm độ tin cậy cho các dự đoán "quá tự tin" không có cơ sở vững chắc ---
+    if final_confidence >= 95.0 and not allow_high_confidence:
+        # Nếu mô hình đang rất tự tin nhưng không rơi vào các trường hợp "chắc chắn" ở trên,
+        # hoặc là một pattern không rõ ràng, thì giảm độ tin cậy.
+        final_confidence = random.uniform(80.0, 95.0) # Giảm xuống một ngưỡng an toàn hơn
+        reason = f"META-LOGIC: Giảm độ tin cậy cho dự đoán quá tự tin ({round(confidence,1)}%) không có cơ sở vững chắc."
+        logging.warning(reason)
+    
+    # Đảm bảo confidence không vượt quá 99.9% để tránh các dự đoán "tuyệt đối" không thực tế,
+    # trừ khi được "allow_high_confidence" ở trên.
+    if not allow_high_confidence:
+        final_confidence = min(final_confidence, 99.9)
+
 
     return final_prediction, final_confidence, reason
 
@@ -323,7 +331,7 @@ def predict_advanced(app, history_str):
     if len(history_str) < 5:
         # Giảm số lượng history cần thiết để có dự đoán sơ bộ sớm hơn
         if len(history_str) < 2:
-             return "Chờ dữ liệu", "Chưa đủ lịch sử", 50.0, {}
+             return "Chờ dữ liệu", "Chưa đủ lịch sử", 50.0, None # Changed to None instead of empty dict
         # Nếu có ít nhất 2 kết quả, có thể đưa ra dự đoán ban đầu dựa trên Markov hoặc Pattern cơ bản
         last_result = history_str[-1]
         anti_last = 'Xỉu' if last_result == 'Tài' else 'Tài'
@@ -344,11 +352,11 @@ def predict_advanced(app, history_str):
                     else: break
             
             if streak_len >= 2 and initial_pred == last_val: # Theo bệt ngắn
-                return initial_pred, "Theo bệt ngắn", min(initial_conf + 10, 80.0), {}
+                return initial_pred, "Theo bệt ngắn", min(initial_conf + 10, 80.0), None # Changed to None
             else: # Nếu không bệt thì thử bẻ
-                return anti_last, "Bẻ cầu cơ bản", min(initial_conf + 5, 70.0), {}
+                return anti_last, "Bẻ cầu cơ bản", min(initial_conf + 5, 70.0), None # Changed to None
         
-        return "Chờ dữ liệu", "Phân tích", 50.0, {}
+        return "Chờ dữ liệu", "Phân tích", 50.0, None # Changed to None
 
     last_result = history_str[-1]
 
@@ -404,9 +412,9 @@ def predict_advanced(app, history_str):
         final_confidence = min(98.0, final_confidence + (patt_conf * 10)) # Tăng thêm dựa trên confidence của pattern
 
     # Áp dụng logic meta cuối cùng
-    used_pattern_name = detected_pattern_info['name'] if detected_pattern_info else "Ensemble"
-    final_prediction, final_confidence, meta_reason = apply_meta_logic(final_prediction, final_confidence, history_str, used_pattern_name)
+    final_prediction, final_confidence, meta_reason = apply_meta_logic(final_prediction, final_confidence, history_str, detected_pattern_info) # Pass the full info
 
+    used_pattern_name = detected_pattern_info['name'] if detected_pattern_info else "Ensemble"
     if meta_reason:
         used_pattern_name = meta_reason # Hiển thị lý do meta-logic nếu có
 
