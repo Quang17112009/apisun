@@ -11,6 +11,7 @@ from flask_cors import CORS
 import requests # Import the requests library for HTTP requests
 
 # --- Basic Setup ---
+# Cấu hình logging để dễ dàng theo dõi lỗi và thông báo
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # --- Helper Functions ---
@@ -188,7 +189,7 @@ def detect_pattern(app, history_str):
 
 def predict_with_pattern(app, history_str, detected_pattern_info):
     if not detected_pattern_info or len(history_str) < 2:
-        return 'Tài', 0.5
+        return 'Tài', 0.5 # Mặc định trả về Tài với độ tự tin trung bình
     
     name = detected_pattern_info['name']
     last = history_str[-1]
@@ -328,7 +329,7 @@ def apply_meta_logic(prediction, confidence, history_str, suggested_pattern_info
 
 def predict_advanced(app, history_str):
     """Hàm điều phối dự đoán nâng cao, kết hợp nhiều mô hình với trọng số động."""
-    # THAY ĐỔI Ở ĐÂY: Trả về dictionary rỗng cho individual_preds khi lịch sử quá ngắn
+    # Khi lịch sử quá ngắn, trả về dự đoán sơ bộ và dictionary rỗng cho individual_preds
     if len(history_str) < 5:
         if len(history_str) < 2:
              return "Chờ dữ liệu", "Chưa đủ lịch sử", 50.0, {} # Đã thay đổi None thành {}
@@ -424,40 +425,43 @@ def predict_advanced(app, history_str):
 # --- Flask App Factory ---
 def create_app():
     app = Flask(__name__)
-    CORS(app)
+    CORS(app) # Cho phép Cross-Origin Resource Sharing để frontend có thể gọi API
 
     # --- Khởi tạo State ---
-    app.lock = threading.Lock()
-    app.MAX_HISTORY_LEN = 200
-    
+    app.lock = threading.Lock() # Khóa để đảm bảo an toàn luồng khi truy cập dữ liệu chung
+    app.MAX_HISTORY_LEN = 200 # Giới hạn độ dài lịch sử để tránh tiêu tốn bộ nhớ
+
+    # Sử dụng deque (double-ended queue) để quản lý lịch sử hiệu quả
     app.history = deque(maxlen=app.MAX_HISTORY_LEN)
     app.session_ids = deque(maxlen=app.MAX_HISTORY_LEN)
     
-    # State cho các thuật toán
-    app.patterns = define_patterns()
-    app.transition_matrix = [[0.5, 0.5], [0.5, 0.5]]
-    app.transition_counts = [[0, 0], [0, 0]]
-    app.logistic_weights = [0.0] * 6 # Mở rộng cho 6 features
-    app.logistic_bias = 0.0
-    app.learning_rate = 0.01
-    app.regularization = 0.01
-    
-    # State cho ensemble model động
-    app.default_model_weights = {'pattern': 0.5, 'markov': 0.2, 'logistic': 0.3}
-    app.model_weights = app.default_model_weights.copy()
-    app.model_performance = {name: {"success": 0, "total": 0} for name in app.model_weights}
+    # State cho các thuật toán dự đoán
+    app.patterns = define_patterns() # Tải các pattern đã định nghĩa
+    app.transition_matrix = [[0.5, 0.5], [0.5, 0.5]] # Ma trận chuyển đổi Markov ban đầu
+    app.transition_counts = [[0, 0], [0, 0]] # Đếm số lần chuyển đổi
+    app.logistic_weights = [0.0] * 6 # Khởi tạo trọng số cho Logistic Regression (tùy thuộc vào số lượng features)
+    app.logistic_bias = 0.0 # Bias cho Logistic Regression
+    app.learning_rate = 0.01 # Tốc độ học cho Logistic Regression
+    app.regularization = 0.01 # Tham số regularization để tránh overfitting
 
-    app.last_prediction = None
-    app.pattern_accuracy = defaultdict(lambda: {"success": 0, "total": 0})
-    
+    # State cho ensemble model động
+    app.default_model_weights = {'pattern': 0.5, 'markov': 0.2, 'logistic': 0.3} # Trọng số mặc định
+    app.model_weights = app.default_model_weights.copy() # Trọng số hiện tại (sẽ được cập nhật động)
+    app.model_performance = {name: {"success": 0, "total": 0} for name in app.model_weights} # Ghi lại hiệu suất từng mô hình con
+
+    app.last_prediction = None # Lưu dự đoán cuối cùng để sử dụng cho online learning
+    app.pattern_accuracy = defaultdict(lambda: {"success": 0, "total": 0}) # Ghi lại độ chính xác của từng pattern
+
     # --- Xử lý API HTTP ---
     # Cập nhật API_URL thành API mới
+    # Đọc API_URL từ biến môi trường, hoặc dùng mặc định nếu không có
     app.API_URL = os.getenv("API_URL", "https://sunwinwanglin.up.railway.app/api/sunwin?key=WangLinID99")
 
     def fetch_data_from_api():
+        """Hàm lấy dữ liệu lịch sử từ API bên ngoài."""
         try:
-            response = requests.get(app.API_URL, timeout=5)
-            response.raise_for_status()  # Raise an exception for HTTP errors
+            response = requests.get(app.API_URL, timeout=5) # Đặt timeout để tránh treo
+            response.raise_for_status()  # Ném ngoại lệ cho lỗi HTTP (4xx hoặc 5xx)
             data = response.json()
             return data
         except requests.exceptions.RequestException as e:
@@ -465,6 +469,7 @@ def create_app():
             return None
 
     def data_fetch_loop():
+        """Vòng lặp chạy ngầm để liên tục lấy dữ liệu mới từ API."""
         last_processed_session_api = None # Theo dõi phiên cuối cùng nhận từ API
         while True:
             data = fetch_data_from_api()
@@ -476,13 +481,13 @@ def create_app():
 
                     if phien_truoc is None or ket_qua not in ["Tài", "Xỉu"]:
                         logging.warning(f"Invalid data received from API: {data}")
-                        time.sleep(1) # Wait a bit before retrying
+                        time.sleep(1) # Chờ một chút trước khi thử lại
                         continue
 
                     # Tính toán phien_hien_tai (phiên vừa kết thúc)
                     phien_hien_tai = phien_truoc + 1
 
-                    with app.lock:
+                    with app.lock: # Đảm bảo an toàn luồng khi cập nhật lịch sử
                         # Chỉ thêm dữ liệu mới nếu phiên hiện tại nhận được từ API lớn hơn phiên cuối cùng trong lịch sử của app
                         # Hoặc nếu lịch sử rỗng
                         if not app.session_ids or phien_hien_tai > app.session_ids[-1]:
@@ -501,17 +506,17 @@ def create_app():
                 except Exception as e:
                     logging.error(f"Unexpected error in data_fetch_loop: {e}")
             
-            time.sleep(1) # Poll the API every 1 second
+            time.sleep(1) # Poll the API mỗi 1 giây
 
     # --- API Endpoints ---
-    @app.route("/api/taixiu_ws", methods=["GET"]) # Renamed from taixiu_ws to avoid confusion, but kept for compatibility
+    @app.route("/api/taixiu_ws", methods=["GET"])
     def get_taixiu_prediction():
-        with app.lock:
+        with app.lock: # Khóa để đảm bảo dữ liệu lịch sử không bị thay đổi trong quá trình xử lý request
             if len(app.history) < 2:
                 # Trả về lỗi hoặc trạng thái "chờ dữ liệu" nếu lịch sử quá ngắn
                 return jsonify({"error": "Chưa có đủ dữ liệu", "prediction": "Đang phân tích", "confidence_percent": 50.0, "suggested_pattern": "Chưa đủ lịch sử"}), 500
             
-            history_copy = list(app.history)
+            history_copy = list(app.history) # Tạo bản sao lịch sử để thao tác
             session_ids_copy = list(app.session_ids)
             last_prediction_copy = app.last_prediction
         
@@ -522,7 +527,7 @@ def create_app():
             prev_history_str = _get_history_strings(history_copy[:-1]) # Lịch sử trước kết quả hiện tại
             actual_result = history_copy[-1]['ket_qua'] # Kết quả thực tế của phiên đã dự đoán
 
-            with app.lock:
+            with app.lock: # Khóa khi cập nhật các tham số mô hình
                 # Học cho Logistic Regression
                 train_logistic_regression(app, last_prediction_copy['features'], actual_result)
                 # Học cho Markov Chain
@@ -531,7 +536,8 @@ def create_app():
                 # Học cho Pattern
                 update_pattern_accuracy(app, last_prediction_copy['pattern_name_for_learning'], last_prediction_copy['prediction'], actual_result)
                 
-                # THAY ĐỔI Ở ĐÂY: Thêm kiểm tra None cho 'individual_predictions'
+                # SỬA LỖI: Thêm kiểm tra None cho 'individual_predictions'
+                # Đảm bảo last_prediction_copy.get('individual_predictions') không phải là None
                 if last_prediction_copy.get('individual_predictions') is not None:
                     for model_name, model_pred in last_prediction_copy['individual_predictions'].items():
                         app.model_performance[model_name]['total'] += 1
@@ -570,8 +576,8 @@ def create_app():
         final_confidence_display = round(confidence, 1)
 
         # Điều kiện để hiển thị "Đang phân tích"
-        # - Lịch sử quá ngắn
-        # - Confidence thấp và không phải là một pattern mạnh được tin cậy
+        # - Lịch sử quá ngắn (dưới 5)
+        # - Confidence thấp (dưới 65%) VÀ không phải là một pattern mạnh được tin cậy
         if len(history_str_for_prediction) < 5 or (final_confidence < 65.0 and "Bẻ cầu" not in pattern_str and "Theo bệt" not in pattern_str):
             prediction_display = f"Đang phân tích"
             final_confidence_display = round(final_confidence, 1)
@@ -587,12 +593,14 @@ def create_app():
 
     @app.route("/api/history", methods=["GET"])
     def get_history_api():
+        """Endpoint để lấy lịch sử kết quả."""
         with app.lock:
             hist_copy = list(app.history)
         return jsonify({"history": hist_copy, "length": len(hist_copy)})
 
     @app.route("/api/performance", methods=["GET"])
     def get_performance():
+        """Endpoint để lấy hiệu suất của các pattern và mô hình con."""
         with app.lock:
             # Sắp xếp pattern theo tổng số lần xuất hiện và độ chính xác
             seen_patterns = {k: v for k, v in app.pattern_accuracy.items() if v['total'] > 0}
@@ -619,6 +627,7 @@ def create_app():
         })
 
     # Start the HTTP data fetching thread
+    # Đảm bảo luồng này chạy ngầm và không chặn luồng chính của Flask
     api_fetch_thread = threading.Thread(target=data_fetch_loop, daemon=True)
     api_fetch_thread.start()
     return app
@@ -627,7 +636,9 @@ def create_app():
 app = create_app()
 
 if __name__ == "__main__":
+    # Lấy cổng từ biến môi trường (cần thiết cho các nền tảng cloud như Render)
     port = int(os.environ.get("PORT", 8080))
     logging.info(f"Flask app ready. Serving on http://0.0.0.0:{port}")
+    # Sử dụng Waitress để phục vụ Flask app một cách ổn định trong môi trường production
     from waitress import serve
     serve(app, host="0.0.0.0", port=port, threads=8)
