@@ -4,3 +4,4 @@ APScheduler
 waitress
 flask-cors
 uvicorn
+numpy
