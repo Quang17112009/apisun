@@ -3,3 +3,4 @@ requests
 APScheduler
 waitress
 flask-cors
+uvicorn
